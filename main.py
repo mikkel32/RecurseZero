@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
 RecurseZero: GPU-Resident Chess RL Agent
-Main training script with live progress monitoring.
+Main training script with smart VRAM management.
 
-Key features:
-- BFloat16 mixed precision (2x memory, faster compute)
-- 4096 batch size (massive parallelism)
-- DEQ with Anderson Acceleration
-- Muesli policy optimization (search-free)
+Features:
+- Automatic VRAM cleaning before training
+- Auto-tuned batch size based on available memory
+- Simple FP32 training (stable and predictable)
 """
 
 print("=" * 60)
@@ -18,8 +17,108 @@ print()
 import sys
 import time
 import subprocess
+import gc
+import os
 
-# Try to import rich for beautiful output
+# ═══════════════════════════════════════════════════════════════════════════════
+# SMART VRAM MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_gpu_stats():
+    """Get GPU statistics using nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,memory.free,temperature.gpu', 
+             '--format=csv,nounits,noheader'],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(',')
+            if len(parts) >= 5:
+                return {
+                    'gpu_util': int(parts[0].strip()),
+                    'mem_used': int(parts[1].strip()),
+                    'mem_total': int(parts[2].strip()),
+                    'mem_free': int(parts[3].strip()),
+                    'temp': int(parts[4].strip()),
+                }
+    except Exception:
+        pass
+    return {'gpu_util': -1, 'mem_used': -1, 'mem_total': -1, 'mem_free': -1, 'temp': -1}
+
+def format_gpu_str(stats):
+    if stats['gpu_util'] < 0:
+        return ""
+    return f"GPU: {stats['gpu_util']}% | VRAM: {stats['mem_used']}/{stats['mem_total']}MB | {stats['temp']}°C"
+
+def clean_vram():
+    """Clean up GPU VRAM before training."""
+    print("🧹 Cleaning VRAM...", flush=True)
+    
+    # Force Python garbage collection
+    gc.collect()
+    
+    # Try to clear JAX caches
+    try:
+        import jax
+        jax.clear_caches()
+        print("  ✓ JAX caches cleared")
+    except Exception:
+        pass
+    
+    # Force garbage collection again
+    gc.collect()
+    
+    stats = get_gpu_stats()
+    if stats['mem_free'] > 0:
+        print(f"  ✓ Free VRAM: {stats['mem_free']}MB / {stats['mem_total']}MB")
+    
+    return stats
+
+def auto_batch_size(target_vram_usage=0.7):
+    """
+    Automatically determine batch size based on available VRAM.
+    
+    Args:
+        target_vram_usage: Target VRAM usage ratio (0.7 = 70%)
+        
+    Returns:
+        Recommended batch size
+    """
+    stats = get_gpu_stats()
+    
+    if stats['mem_total'] < 0:
+        print("  ⚠ Cannot detect VRAM, using default batch size")
+        return 2048
+    
+    total_mb = stats['mem_total']
+    
+    # Estimate: ~4MB per game in batch for our model size
+    # This is a rough estimate based on observations
+    mb_per_game = 4
+    
+    # Target VRAM = total * target_ratio
+    target_mb = total_mb * target_vram_usage
+    
+    # Reserve some VRAM for model weights (~2GB) and overhead (~2GB)
+    available_mb = target_mb - 4000
+    
+    if available_mb < 1000:
+        batch = 512
+    else:
+        batch = int(available_mb / mb_per_game)
+    
+    # Round to power of 2 for efficiency
+    batch = 2 ** int(batch).bit_length() - 1
+    batch = max(512, min(8192, (batch // 512) * 512))  # Round to 512
+    
+    print(f"  ✓ Auto batch size: {batch} (based on {total_mb}MB VRAM)")
+    return batch
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# IMPORT DEPENDENCIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
 try:
     from rich.console import Console
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -35,15 +134,6 @@ import jax
 import jax.numpy as jnp
 print(f"✓ JAX loaded (backend: {jax.default_backend()})", flush=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CRITICAL: Initialize mixed precision BEFORE importing models!
-# This ensures get_dtype() returns BF16 when models are constructed
-# ═══════════════════════════════════════════════════════════════════════════════
-print("Initializing mixed precision...", flush=True)
-from optimization.mixed_precision import init_mixed_precision, get_dtype, is_bf16_enabled
-init_mixed_precision(enable=True)
-print(f"  Compute dtype: {get_dtype()}", flush=True)
-
 print("Loading Optax...", flush=True)
 import optax
 print("✓ Optax loaded", flush=True)
@@ -52,9 +142,8 @@ print("Loading environment...", flush=True)
 from env.pgx_wrapper import RecurseEnv
 print("✓ Environment loaded", flush=True)
 
-# NOW import models (after BF16 is initialized)
 print("Loading model...", flush=True)
-from model.agent import RecurseZeroAgent, RecurseZeroAgentFast
+from model.agent import RecurseZeroAgentFast
 print("✓ Model loaded", flush=True)
 
 print("Loading training loop...", flush=True)
@@ -64,36 +153,6 @@ print("✓ Training loop loaded", flush=True)
 print("Loading hardware config...", flush=True)
 from optimization.hardware_compat import setup_jax_platform
 print("✓ Hardware config loaded", flush=True)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# GPU MONITORING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def get_gpu_stats():
-    """Get GPU statistics using nvidia-smi."""
-    try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu', 
-             '--format=csv,nounits,noheader'],
-            capture_output=True, text=True, timeout=2
-        )
-        if result.returncode == 0:
-            parts = result.stdout.strip().split(',')
-            if len(parts) >= 4:
-                return {
-                    'gpu_util': int(parts[0].strip()),
-                    'mem_used': int(parts[1].strip()),
-                    'mem_total': int(parts[2].strip()),
-                    'temp': int(parts[3].strip()),
-                }
-    except Exception:
-        pass
-    return {'gpu_util': -1, 'mem_used': -1, 'mem_total': -1, 'temp': -1}
-
-def format_gpu_str(stats):
-    if stats['gpu_util'] < 0:
-        return ""
-    return f"GPU: {stats['gpu_util']}% | VRAM: {stats['mem_used']}/{stats['mem_total']}MB | {stats['temp']}°C"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN TRAINING LOOP
@@ -107,8 +166,11 @@ def main():
     
     setup_jax_platform()
     
-    # BF16 is already initialized above
-    print(f"✓ Using dtype: {get_dtype()}")
+    # Clean VRAM and auto-tune batch size
+    print()
+    clean_vram()
+    BATCH_SIZE = auto_batch_size(target_vram_usage=0.75)
+    print()
     
     # Apply Metal Patch for Pgx
     print("Applying Pgx patches...", flush=True)
@@ -116,7 +178,6 @@ def main():
     apply_patch()
     
     # 1. Initialize Environment
-    BATCH_SIZE = 4096  # Large batch for throughput
     print(f"Initializing environment (batch_size={BATCH_SIZE})...", flush=True)
     env = RecurseEnv(batch_size=BATCH_SIZE)
     key = jax.random.PRNGKey(42)
@@ -125,20 +186,17 @@ def main():
     env_state = env.init(env_key)
     print(f"✓ Environment: Batch={BATCH_SIZE}, Actions={env.num_actions}", flush=True)
     
-    # 2. Initialize Model (BF16 is already set globally)
+    # 2. Initialize Model (simple FP32 - stable and predictable)
     print("Initializing model...", flush=True)
     agent = RecurseZeroAgentFast(num_actions=env.num_actions)
-    
-    # Use the correct dtype for dummy input
-    dummy_dtype = get_dtype()
-    dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=dummy_dtype)
+    dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
     
     key, init_key = jax.random.split(key)
     params = agent.init(init_key, dummy_obs)
     
-    # Verify dtype
-    sample_param = jax.tree_util.tree_leaves(params)[0]
-    print(f"✓ Model initialized (param dtype: {sample_param.dtype})", flush=True)
+    # Count parameters
+    param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
+    print(f"✓ Model initialized ({param_count:,} parameters)", flush=True)
     
     # 3. Optimizer Setup
     print("Setting up optimizer...", flush=True)
@@ -152,6 +210,11 @@ def main():
         tx=optimizer
     )
     print("✓ Optimizer ready", flush=True)
+    
+    # Check VRAM after setup
+    gc.collect()
+    stats = get_gpu_stats()
+    print(f"✓ Setup complete | {format_gpu_str(stats)}")
     
     # 4. JIT Warmup
     print()
@@ -180,7 +243,7 @@ def main():
     
     print()
     print("=" * 60)
-    print(f"TRAINING ({NUM_STEPS:,} steps)")
+    print(f"TRAINING ({NUM_STEPS:,} steps @ batch={BATCH_SIZE})")
     print("=" * 60)
     print()
     
@@ -228,7 +291,6 @@ def main():
                 if i % PRINT_EVERY == 0 or i == NUM_STEPS - 1:
                     gpu_stats = get_gpu_stats()
                     loss_val = float(metrics['total_loss'])
-                    
                     win_prob = float(metrics.get('win_probability', 0.5))
                     confidence = float(metrics.get('confidence', 0.5))
                     
@@ -236,13 +298,11 @@ def main():
                         f"  Step {i:5d} │ "
                         f"Loss: {loss_val:7.4f} │ "
                         f"P(win): {win_prob:.1%} │ "
-                        f"Conf: {confidence:.0%} │ "
                         f"Games: {total_games:,} (W:{total_wins}/L:{total_losses}/D:{total_draws}) │ "
                         f"{steps_per_sec:.1f} s/s │ "
                         f"{format_gpu_str(gpu_stats)}"
                     )
     else:
-        # Plain output fallback
         for i in range(NUM_STEPS):
             step_start = time.time()
             
@@ -264,30 +324,26 @@ def main():
                 recent_times = step_times[-50:]
                 avg_step_time = sum(recent_times) / len(recent_times)
                 steps_per_sec = 1.0 / avg_step_time if avg_step_time > 0 else 0
-                
                 print(f"Step {i:5d} | Loss: {float(metrics['total_loss']):.4f} | "
                       f"Games: {total_games} | {steps_per_sec:.1f} s/s")
     
     # 6. Training Complete
     print()
     print("=" * 60)
-    print("TRAINING COMPLETE")
+    print("✅ TRAINING COMPLETE")
     print("=" * 60)
     
     total_time = sum(step_times)
     avg_speed = NUM_STEPS / total_time if total_time > 0 else 0
+    positions_per_sec = avg_speed * BATCH_SIZE
     
-    print(f"  Total steps: {NUM_STEPS:,}")
-    print(f"  Total time: {total_time:.1f}s")
-    print(f"  Avg speed: {avg_speed:.2f} steps/s")
-    print(f"  Compute dtype: {get_dtype()}")
-    print(f"  Total games: {total_games:,}")
-    print(f"  Wins/Losses/Draws: {total_wins}/{total_losses}/{total_draws}")
-    
-    win_rate = total_wins / max(1, total_games) * 100
-    draw_rate = total_draws / max(1, total_games) * 100
-    print(f"  Win rate: {win_rate:.1f}%")
-    print(f"  Draw rate: {draw_rate:.1f}%")
+    print(f"  Steps: {NUM_STEPS:,} | Time: {total_time:.0f}s | Speed: {avg_speed:.1f} s/s")
+    print(f"  Positions/sec: {positions_per_sec:,.0f}")
+    print(f"  Games played: {total_games:,}")
+    print(f"  W/L/D: {total_wins}/{total_losses}/{total_draws}")
+    if total_games > 0:
+        print(f"  Win rate: {100*total_wins/total_games:.1f}%")
+        print(f"  Draw rate: {100*total_draws/total_games:.1f}%")
     print()
 
 if __name__ == "__main__":

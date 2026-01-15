@@ -1,5 +1,5 @@
 """
-RecurseZero Agent with BFloat16 Mixed Precision.
+RecurseZero Agent - Fast and Stable.
 
 Per GPU ONLY Chess RL Agent.txt spec:
 - DEQ core with Anderson Acceleration
@@ -7,7 +7,8 @@ Per GPU ONLY Chess RL Agent.txt spec:
 - Chess-aware positional encodings
 - Muesli policy head (search-free)
 - PVE value/reward heads
-- BFloat16 for 2x memory savings and faster compute
+
+Optimized for L4 GPU with FP32 training.
 """
 
 import jax
@@ -18,25 +19,12 @@ from .universal_transformer import UniversalTransformerBlock
 from algorithm.muesli import PolicyHead
 from algorithm.pve import ValueHead, RewardHead
 
-# Get compute dtype
-try:
-    from optimization.mixed_precision import get_dtype, is_bf16_enabled
-except ImportError:
-    def get_dtype():
-        return jnp.float32
-    def is_bf16_enabled():
-        return False
-
 
 class RecurseZeroAgent(nn.Module):
     """
-    Full RecurseZero Agent with BFloat16 mixed precision.
+    Full RecurseZero Agent (spec-compliant).
     
-    Structure:
-    Input (Board) -> Embedding -> DEQ -> Abstract State z*
-    z* -> Policy Head -> Logits
-    z* -> Value Head -> V(s)
-    z* -> Reward Head -> R(s)
+    Uses larger dimensions for maximum performance.
     """
     hidden_dim: int = 256
     heads: int = 8
@@ -49,14 +37,8 @@ class RecurseZeroAgent(nn.Module):
     
     @nn.compact
     def __call__(self, x):
-        # Get compute dtype (BF16 or FP32)
-        compute_dtype = get_dtype()
-        
-        # Cast input to compute dtype
-        x = x.astype(compute_dtype)
-        
-        # 1. Input Embedding (in BF16)
-        x_embed = nn.Dense(self.hidden_dim, dtype=compute_dtype, name='input_embed')(x)
+        # 1. Input Embedding
+        x_embed = nn.Dense(self.hidden_dim, name='input_embed')(x)
         x_flat = x_embed.reshape(x_embed.shape[0], -1, self.hidden_dim)
         
         # 2. DEQ Core
@@ -66,7 +48,6 @@ class RecurseZeroAgent(nn.Module):
                 'hidden_dim': self.hidden_dim,
                 'heads': self.heads,
                 'mlp_dim': self.mlp_dim,
-                'dtype': compute_dtype,  # Pass dtype to block
             },
             max_iter=self.deq_iters,
             tol=self.deq_tol,
@@ -77,8 +58,8 @@ class RecurseZeroAgent(nn.Module):
         
         z_star = deq(x_flat)
         
-        # 3. Output Heads (cast back to FP32 for stability)
-        z_pooled = jnp.mean(z_star, axis=1).astype(jnp.float32)
+        # 3. Output Heads
+        z_pooled = jnp.mean(z_star, axis=1)
         
         policy_logits = PolicyHead(self.hidden_dim, self.num_actions, name='policy')(z_pooled)
         value = ValueHead(self.hidden_dim, name='value')(z_pooled)
@@ -89,9 +70,10 @@ class RecurseZeroAgent(nn.Module):
 
 class RecurseZeroAgentFast(nn.Module):
     """
-    Speed-optimized version with BFloat16 for L4 GPU.
+    Speed-optimized agent for L4 GPU.
     
-    Reduced parameters + BF16 = maximum throughput.
+    Reduced parameters for faster training.
+    Target: 2-4 steps/second on L4.
     """
     hidden_dim: int = 128
     heads: int = 4
@@ -104,24 +86,17 @@ class RecurseZeroAgentFast(nn.Module):
     
     @nn.compact
     def __call__(self, x):
-        # Get compute dtype (BF16 or FP32)
-        compute_dtype = get_dtype()
-        
-        # Cast input
-        x = x.astype(compute_dtype)
-        
         # 1. Embedding
-        x_embed = nn.Dense(self.hidden_dim, dtype=compute_dtype, name='input_embed')(x)
+        x_embed = nn.Dense(self.hidden_dim, name='input_embed')(x)
         x_flat = x_embed.reshape(x_embed.shape[0], -1, self.hidden_dim)
         
-        # 2. DEQ Core with BF16
+        # 2. DEQ Core
         deq = DeepEquilibriumModel(
             block_class=UniversalTransformerBlock,
             block_args={
                 'hidden_dim': self.hidden_dim,
                 'heads': self.heads,
                 'mlp_dim': self.mlp_dim,
-                'dtype': compute_dtype,
             },
             max_iter=self.deq_iters,
             tol=self.deq_tol,
@@ -132,8 +107,8 @@ class RecurseZeroAgentFast(nn.Module):
         
         z_star = deq(x_flat)
         
-        # 3. Output Heads (FP32)
-        z_pooled = jnp.mean(z_star, axis=1).astype(jnp.float32)
+        # 3. Output Heads
+        z_pooled = jnp.mean(z_star, axis=1)
         
         policy_logits = PolicyHead(self.hidden_dim, self.num_actions, name='policy')(z_pooled)
         value = ValueHead(self.hidden_dim, name='value')(z_pooled)
