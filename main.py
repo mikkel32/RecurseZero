@@ -98,16 +98,12 @@ def main():
     
     setup_jax_platform()
     
-    # Initialize Int8 Quantization (2-4x speedup on Tensor Cores)
-    if jax.default_backend() == 'gpu':
-        try:
-            from optimization.quantization import init_quantization
-            init_quantization(enable=True)
-        except ImportError as e:
-            print(f"⚠ Quantization module error: {e}")
-            print("  Install with: pip install aqtp")
-    else:
-        print("⚪ Int8 skipped (requires CUDA GPU)")
+    # Initialize BFloat16 Mixed Precision (2x memory savings, 1.5x speedup)
+    try:
+        from optimization.mixed_precision import init_mixed_precision
+        init_mixed_precision(enable=True)
+    except ImportError:
+        print("⚪ Mixed precision not available")
     
     # Apply Metal Patch for Pgx
     print("Applying Pgx patches...", flush=True)
