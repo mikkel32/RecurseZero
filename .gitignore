@@ -23,7 +23,6 @@ wheels/
 # Virtual Environment
 venv/
 ENV/
-env/
 .venv/
 
 # IDE

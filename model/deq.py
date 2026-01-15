@@ -274,7 +274,7 @@ class DeepEquilibriumModel(nn.Module):
     """
     block_class: Any
     block_args: Dict[str, Any]
-    max_iter: int = 12
+    max_iter: int = 6  # Reduced from 12 for speed (spec: adaptive early-exit)
     tol: float = 1e-4
     beta: float = 1.0 # Anderson mixing beta / Dampening factor
 
