@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Lichess Database Training for RecurseZero - OPTIMIZED VERSION
+Lichess Database Training for RecurseZero - MEMORY OPTIMIZED
 
-Fast download with live progress + efficient PGN parsing.
+Uses streaming parser with numpy arrays to avoid memory explosion.
 All training 100% on GPU (zero CPU during training).
 
 Usage:
@@ -15,10 +15,9 @@ import time
 import pickle
 import argparse
 import subprocess
-from typing import List, Tuple, Generator
+import gc
+from typing import List, Tuple
 from functools import partial
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing as mp
 
 print("=" * 60)
 print("🎯 RecurseZero - Lichess Human Data Training")
@@ -30,6 +29,7 @@ os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 print(f"✓ JAX loaded (backend: {jax.default_backend()})")
@@ -50,6 +50,7 @@ import chess.pgn
 import zstandard
 import requests
 import io
+import re
 from tqdm import tqdm
 
 
@@ -58,7 +59,6 @@ from tqdm import tqdm
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_gpu_stats():
-    """Get GPU stats (usage, memory, temperature)."""
     try:
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu',
@@ -74,13 +74,11 @@ def get_gpu_stats():
                     'mem_total': int(parts[2].strip()),
                     'temp': int(parts[3].strip()),
                 }
-    except Exception:
+    except:
         pass
     return None
 
-
 def format_gpu_stats():
-    """Format GPU stats for display."""
     stats = get_gpu_stats()
     if stats:
         return f"GPU:{stats['gpu']}% | {stats['mem_used']//1024}G/{stats['mem_total']//1024}G | {stats['temp']}°C"
@@ -88,59 +86,46 @@ def format_gpu_stats():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FAST DOWNLOAD WITH LIVE PROGRESS
+# DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════════════
 
 LICHESS_DB_URL = "https://database.lichess.org/standard/lichess_db_standard_rated_{month}.pgn.zst"
 DATA_DIR = "lichess_data"
 
-
 def download_with_progress(url: str, filepath: str, max_bytes: int = None) -> str:
-    """Download file with live progress bar."""
     response = requests.get(url, stream=True, timeout=30)
     response.raise_for_status()
     
     total_size = int(response.headers.get('content-length', 0))
-    
     if max_bytes and total_size > max_bytes:
         print(f"   File is {total_size/(1024**3):.1f} GB, limiting to {max_bytes/(1024**3):.1f} GB")
         total_size = max_bytes
     
-    block_size = 1024 * 1024  # 1MB blocks for speed
     downloaded = 0
-    
     with open(filepath, 'wb') as f:
         with tqdm(total=total_size, unit='B', unit_scale=True, desc="   Downloading") as pbar:
-            for chunk in response.iter_content(chunk_size=block_size):
+            for chunk in response.iter_content(chunk_size=1024*1024):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
                     pbar.update(len(chunk))
-                    
                     if max_bytes and downloaded >= max_bytes:
                         break
-    
     return filepath
 
-
 def get_lichess_database(month: str = "2019-09", max_gb: float = 1.0) -> str:
-    """Get Lichess database (download if needed)."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    
     filepath = os.path.join(DATA_DIR, f"lichess_{month}.pgn.zst")
     
     if os.path.exists(filepath):
-        size_gb = os.path.getsize(filepath) / (1024**3)
-        print(f"✓ Found cached: {filepath} ({size_gb:.2f} GB)")
+        print(f"✓ Found cached: {filepath}")
         return filepath
     
     url = LICHESS_DB_URL.format(month=month)
     print(f"📥 Downloading Lichess {month}")
-    print(f"   URL: {url}")
     
     try:
-        max_bytes = int(max_gb * 1024**3)
-        download_with_progress(url, filepath, max_bytes)
+        download_with_progress(url, filepath, int(max_gb * 1024**3))
         print(f"✓ Downloaded: {filepath}")
         return filepath
     except Exception as e:
@@ -149,402 +134,220 @@ def get_lichess_database(month: str = "2019-09", max_gb: float = 1.0) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INTELLIGENT PGN PARSING WITH STOCKFISH EVALS
-# Uses Pgx-style 119-plane encoding for GPU compatibility
+# MEMORY-EFFICIENT PGN PARSER
+# Uses numpy arrays directly - NO Python lists of lists!
 # ═══════════════════════════════════════════════════════════════════════════════
 
-import re
-
-# Regex to extract Stockfish eval from comment
 EVAL_PATTERN = re.compile(r'\[%eval ([+-]?\d+\.?\d*|#[+-]?\d+)\]')
 
-
 def extract_eval(comment: str) -> float:
-    """
-    Extract Stockfish evaluation from PGN comment.
-    
-    Returns:
-        Float in range [-1, 1] (normalized centipawn or mate score)
-    """
+    """Extract Stockfish eval, normalized to [-1, 1]."""
     if not comment:
         return None
-    
     match = EVAL_PATTERN.search(comment)
     if not match:
         return None
     
     eval_str = match.group(1)
-    
-    # Mate score: #4 = mate in 4
     if eval_str.startswith('#'):
-        mate_in = int(eval_str[1:])
-        # Normalize mate: faster mate = closer to +/-1
-        return 1.0 if mate_in > 0 else -1.0
+        return 1.0 if int(eval_str[1:]) > 0 else -1.0
     
-    # Centipawn score: normalize to [-1, 1]
     cp = float(eval_str)
-    # Sigmoid-like normalization: 3 pawns advantage ≈ 95% win
-    normalized = 2.0 / (1.0 + 10.0 ** (-cp / 4.0)) - 1.0
-    return max(-1.0, min(1.0, normalized))
+    # Sigmoid normalization
+    return max(-1.0, min(1.0, 2.0 / (1.0 + 10.0 ** (-cp / 4.0)) - 1.0))
 
 
-def board_to_pgx_planes(board: chess.Board) -> list:
+def board_to_array(board: chess.Board) -> np.ndarray:
     """
-    Convert board to Pgx-style 119-plane encoding.
+    Convert board to numpy array (17 planes, 8x8).
     
-    Planes 0-5:   White pieces (P, N, B, R, Q, K)
-    Planes 6-11:  Black pieces
-    Planes 12-15: Castling rights (KQkq)
-    Plane 16:     Side to move
-    Planes 17-18: En passant file
-    Planes 19+:   Repetition counter, halfmove clock (zeros for now)
+    MEMORY EFFICIENT: Returns numpy array, not Python lists!
     """
-    planes = []
+    planes = np.zeros((17, 8, 8), dtype=np.float32)
     
-    # Piece planes (0-11): 6 piece types × 2 colors
-    for color in [chess.WHITE, chess.BLACK]:
-        for piece_type in range(1, 7):  # PAWN=1, KING=6
-            plane = [[0.0] * 8 for _ in range(8)]
+    # Piece planes (0-11)
+    for color_idx, color in enumerate([chess.WHITE, chess.BLACK]):
+        for piece_type in range(1, 7):
+            plane_idx = color_idx * 6 + (piece_type - 1)
             for sq in board.pieces(piece_type, color):
                 rank, file = divmod(sq, 8)
-                plane[rank][file] = 1.0
-            planes.append(plane)
+                planes[plane_idx, rank, file] = 1.0
     
-    # Castling rights (12-15)
-    for right in [
-        board.has_kingside_castling_rights(chess.WHITE),
-        board.has_queenside_castling_rights(chess.WHITE),
-        board.has_kingside_castling_rights(chess.BLACK),
-        board.has_queenside_castling_rights(chess.BLACK),
-    ]:
-        planes.append([[float(right)] * 8 for _ in range(8)])
+    # Castling (12-15)
+    planes[12, :, :] = float(board.has_kingside_castling_rights(chess.WHITE))
+    planes[13, :, :] = float(board.has_queenside_castling_rights(chess.WHITE))
+    planes[14, :, :] = float(board.has_kingside_castling_rights(chess.BLACK))
+    planes[15, :, :] = float(board.has_queenside_castling_rights(chess.BLACK))
     
     # Side to move (16)
-    planes.append([[float(board.turn)] * 8 for _ in range(8)])
+    planes[16, :, :] = float(board.turn)
     
-    # En passant (17): file indicator
-    ep_plane = [[0.0] * 8 for _ in range(8)]
-    if board.ep_square is not None:
-        ep_file = board.ep_square % 8
-        for rank in range(8):
-            ep_plane[rank][ep_file] = 1.0
-    planes.append(ep_plane)
-    
-    # Halfmove clock normalized (18)
-    halfmove = min(board.halfmove_clock / 100.0, 1.0)
-    planes.append([[halfmove] * 8 for _ in range(8)])
-    
-    # Fullmove number normalized (19)
-    fullmove = min(board.fullmove_number / 200.0, 1.0)
-    planes.append([[fullmove] * 8 for _ in range(8)])
-    
-    # Pad remaining planes with zeros to reach 119
-    while len(planes) < 119:
-        planes.append([[0.0] * 8 for _ in range(8)])
-    
-    return planes[:119]
+    return planes
 
 
-def move_to_pgx_action(move: chess.Move, board: chess.Board) -> int:
+def move_to_action(move: chess.Move) -> int:
+    """Simple action encoding: from_sq * 64 + to_sq, clamped to 4672."""
+    return (move.from_square * 64 + move.to_square) % 4672
+
+
+def stream_positions(filepath: str, max_games: int, max_positions: int):
     """
-    Convert move to Pgx-compatible action index.
+    STREAMING parser - memory efficient!
     
-    Action space: 64 squares × 73 move types = 4672
-    - Queen moves: 56 (8 directions × 7 distances)
-    - Knight moves: 8
-    - Underpromotions: 9 (3 piece types × 3 directions)
+    Yields (obs, action, target) as numpy arrays.
     """
-    from_sq = move.from_square
-    to_sq = move.to_square
-    
-    # Direction and distance
-    rank_diff = (to_sq // 8) - (from_sq // 8)
-    file_diff = (to_sq % 8) - (from_sq % 8)
-    
-    # Knight moves (8 types)
-    knight_moves = [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
-    for i, (dr, df) in enumerate(knight_moves):
-        if rank_diff == dr and file_diff == df:
-            return from_sq * 73 + 56 + i
-    
-    # Queen moves (56 types: 8 directions × 7 distances)
-    directions = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
-    for dir_idx, (dr, df) in enumerate(directions):
-        if dr != 0 and df != 0:  # Diagonal
-            if rank_diff != 0 and abs(rank_diff) == abs(file_diff) and \
-               (rank_diff // abs(rank_diff) == dr) and (file_diff // abs(file_diff) == df):
-                distance = abs(rank_diff) - 1
-                return from_sq * 73 + dir_idx * 7 + distance
-        elif dr != 0:  # Vertical
-            if file_diff == 0 and rank_diff != 0 and (rank_diff // abs(rank_diff) == dr):
-                distance = abs(rank_diff) - 1
-                return from_sq * 73 + dir_idx * 7 + distance
-        else:  # Horizontal
-            if rank_diff == 0 and file_diff != 0 and (file_diff // abs(file_diff) == df):
-                distance = abs(file_diff) - 1
-                return from_sq * 73 + dir_idx * 7 + distance
-    
-    # Underpromotions (9 types)
-    if move.promotion and move.promotion != chess.QUEEN:
-        promo_map = {chess.ROOK: 0, chess.BISHOP: 1, chess.KNIGHT: 2}
-        promo_idx = promo_map.get(move.promotion, 0)
-        dir_idx = 1 + file_diff  # 0=left, 1=straight, 2=right
-        return from_sq * 73 + 64 + promo_idx * 3 + dir_idx
-    
-    # Default: from * 73 + to (fallback)
-    return (from_sq * 73 + to_sq) % 4672
-
-
-def parse_single_game(game_text: str) -> List[Tuple]:
-    """
-    Parse PGN game with intelligent feature extraction.
-    
-    Extracts:
-    - Pgx-style 119-plane board encoding
-    - Pgx-compatible action encoding
-    - Stockfish eval as training target (if available)
-    - Falls back to game result
-    """
-    positions = []
-    
-    try:
-        game = chess.pgn.read_game(io.StringIO(game_text))
-        if not game:
-            return []
-        
-        # Get result as fallback
-        result_str = game.headers.get('Result', '*')
-        if result_str == '1-0':
-            white_result = 1.0
-        elif result_str == '0-1':
-            white_result = -1.0
-        else:
-            white_result = 0.0
-        
-        # Get ELO for filtering quality games
-        try:
-            white_elo = int(game.headers.get('WhiteElo', 0))
-            black_elo = int(game.headers.get('BlackElo', 0))
-            avg_elo = (white_elo + black_elo) // 2
-        except:
-            avg_elo = 0
-        
-        board = game.board()
-        node = game
-        
-        for node in game.mainline():
-            move = node.move
-            comment = node.comment
-            
-            # Get Stockfish eval if available (SMARTER target!)
-            sf_eval = extract_eval(comment)
-            
-            if sf_eval is not None:
-                # Use Stockfish eval (much better than game result!)
-                target = sf_eval if board.turn == chess.WHITE else -sf_eval
-            else:
-                # Fall back to game result
-                target = white_result if board.turn == chess.WHITE else -white_result
-            
-            # Pgx-style board encoding
-            obs = board_to_pgx_planes(board)
-            
-            # Pgx-compatible action
-            action = move_to_pgx_action(move, board)
-            
-            positions.append((obs, action, target))
-            board.push(move)
-            
-    except Exception as e:
-        pass
-    
-    return positions
-
-
-def extract_games_fast(filepath: str, max_games: int) -> List[str]:
-    """Extract games from zst file quickly."""
     if not filepath or not os.path.exists(filepath):
-        return []
+        print("No file found, using sample data")
+        for _ in range(min(1000, max_positions)):
+            yield np.zeros((17, 8, 8), dtype=np.float32), 0, 0.0
+        return
     
-    games = []
     dctx = zstandard.ZstdDecompressor()
-    current_game = []
+    games_processed = 0
+    positions_yielded = 0
     
-    print(f"📖 Extracting games from {filepath}...")
+    print(f"📖 Streaming from {filepath}...")
     
     with open(filepath, 'rb') as f:
         with dctx.stream_reader(f) as reader:
             text_stream = io.TextIOWrapper(reader, encoding='utf-8', errors='ignore')
             
-            with tqdm(total=max_games, desc="   Extracting", unit="games") as pbar:
-                for line in text_stream:
-                    current_game.append(line)
-                    
-                    # End of game
-                    if line.strip().endswith(('1-0', '0-1', '1/2-1/2', '*')):
-                        game_text = ''.join(current_game)
-                        
-                        # Skip short games
-                        if game_text.count('.') > 10:  # At least 10 moves
-                            games.append(game_text)
-                            pbar.update(1)
-                        
-                        current_game = []
-                        
-                        if len(games) >= max_games:
+            with tqdm(total=max_positions, desc="   Processing", unit="pos") as pbar:
+                while games_processed < max_games and positions_yielded < max_positions:
+                    try:
+                        game = chess.pgn.read_game(text_stream)
+                        if game is None:
                             break
+                        
+                        # Get result
+                        result_str = game.headers.get('Result', '*')
+                        if result_str == '1-0':
+                            white_result = 1.0
+                        elif result_str == '0-1':
+                            white_result = -1.0
+                        else:
+                            white_result = 0.0
+                        
+                        board = game.board()
+                        
+                        for node in game.mainline():
+                            if positions_yielded >= max_positions:
+                                break
+                            
+                            move = node.move
+                            
+                            # Get eval or use result
+                            sf_eval = extract_eval(node.comment)
+                            if sf_eval is not None:
+                                target = sf_eval if board.turn == chess.WHITE else -sf_eval
+                            else:
+                                target = white_result if board.turn == chess.WHITE else -white_result
+                            
+                            # Board as numpy array (memory efficient!)
+                            obs = board_to_array(board)
+                            action = move_to_action(move)
+                            
+                            yield obs, action, target
+                            positions_yielded += 1
+                            pbar.update(1)
+                            
+                            board.push(move)
+                        
+                        games_processed += 1
+                        
+                    except Exception:
+                        continue
     
-    print(f"✓ Extracted {len(games):,} games")
-    return games
+    print(f"✓ Streamed {positions_yielded:,} positions from {games_processed:,} games")
 
 
-def parallel_parse_games(games: List[str], max_positions: int, num_workers: int = 4) -> Tuple:
-    """Parse games in parallel using multiple CPU cores."""
-    print(f"🔄 Parsing games with {num_workers} workers...")
+def collect_positions(filepath: str, max_games: int, max_positions: int):
+    """
+    Collect positions into numpy arrays (memory efficient).
     
-    all_obs = []
-    all_actions = []
-    all_results = []
-    total_positions = 0
+    Pre-allocates arrays to avoid memory fragmentation.
+    """
+    print(f"📊 Pre-allocating arrays for {max_positions:,} positions...")
     
-    with tqdm(total=min(len(games), max_positions // 40), desc="   Parsing", unit="games") as pbar:
-        # Process in batches to show progress
-        batch_size = 100
+    # Pre-allocate (this is key for memory efficiency!)
+    obs_array = np.zeros((max_positions, 17, 8, 8), dtype=np.float32)
+    actions_array = np.zeros(max_positions, dtype=np.int16)
+    targets_array = np.zeros(max_positions, dtype=np.float32)
+    
+    idx = 0
+    for obs, action, target in stream_positions(filepath, max_games, max_positions):
+        obs_array[idx] = obs
+        actions_array[idx] = action
+        targets_array[idx] = target
+        idx += 1
         
-        for i in range(0, len(games), batch_size):
-            batch = games[i:i+batch_size]
-            
-            # Parse batch
-            for game_text in batch:
-                positions = parse_single_game(game_text)
-                
-                for obs, action, result in positions:
-                    if total_positions >= max_positions:
-                        break
-                    
-                    all_obs.append(obs)
-                    all_actions.append(action)
-                    all_results.append(result)
-                    total_positions += 1
-                
-                if total_positions >= max_positions:
-                    break
-            
-            pbar.update(len(batch))
-            
-            if total_positions >= max_positions:
-                break
+        if idx >= max_positions:
+            break
     
-    print(f"✓ Parsed {total_positions:,} positions")
-    return all_obs, all_actions, all_results
+    # Trim to actual size
+    obs_array = obs_array[:idx]
+    actions_array = actions_array[:idx]
+    targets_array = targets_array[:idx]
+    
+    print(f"✓ Collected {idx:,} positions")
+    print(f"   Memory: {obs_array.nbytes / (1024**3):.2f} GB")
+    
+    return obs_array, actions_array, targets_array
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GPU DATA LOADING (100% GPU after this point)
-# Supports QUANTIZED data to fit 4x more positions in VRAM
-# Uses Pgx-style 119-plane encoding for full GPU compatibility
+# GPU DATA LOADING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_to_gpu(all_obs, all_actions, all_results, quantize: bool = True):
-    """
-    Transfer all data to GPU VRAM.
-    
-    Input format: observations are (N, 119, 8, 8) from Pgx-style encoding
-    Output format: (N, 8, 8, 119) for model (NHWC)
-    
-    Args:
-        quantize: If True, use Int8 for observations (4x memory savings)
-    """
+def load_to_gpu(obs_np, actions_np, targets_np):
+    """Transfer numpy arrays to GPU."""
     print("📤 Transferring to GPU VRAM...")
     
-    import numpy as np
+    # Transpose: (N, 17, 8, 8) -> (N, 8, 8, 17)
+    obs_np = np.transpose(obs_np, (0, 2, 3, 1))
     
-    # Convert observations: (N, 119, 8, 8) -> (N, 8, 8, 119)
-    obs_np = np.array(all_obs, dtype=np.float32)
-    obs_np = np.transpose(obs_np, (0, 2, 3, 1))  # NCHW -> NHWC
-    
+    # Pad to 119 channels for model compatibility
     N = obs_np.shape[0]
-    print(f"   Positions: {N:,} | Planes: {obs_np.shape[-1]}")
+    obs_padded = np.zeros((N, 8, 8, 119), dtype=np.float32)
+    obs_padded[:, :, :, :17] = obs_np
     
-    if quantize:
-        # QUANTIZED: Use Int8 for observations (4x memory savings)
-        print("   Quantization: Int8 observations (4x memory savings)")
-        
-        # Scale to Int8 range and convert
-        obs_int8 = (obs_np * 127).astype(np.int8)
-        
-        actions_np = np.array(all_actions, dtype=np.int16)
-        results_np = np.array(all_results, dtype=np.float16)
-        
-        # Transfer to GPU
-        obs = jax.device_put(jnp.array(obs_int8))
-        actions = jax.device_put(jnp.array(actions_np))
-        results = jax.device_put(jnp.array(results_np))
-        
-    else:
-        # Full precision (FP32)
-        obs_padded = np.zeros((N, 8, 8, 119), dtype=np.float32)
-        obs_padded[:, :, :, :17] = obs_np
-        
-        actions_np = np.array(all_actions, dtype=np.int32)
-        results_np = np.array(all_results, dtype=np.float32)
-        
-        obs = jax.device_put(jnp.array(obs_padded))
-        actions = jax.device_put(jnp.array(actions_np))
-        results = jax.device_put(jnp.array(results_np))
+    # Transfer to GPU
+    obs = jax.device_put(jnp.array(obs_padded))
+    actions = jax.device_put(jnp.array(actions_np.astype(np.int32)))
+    targets = jax.device_put(jnp.array(targets_np))
     
     jax.block_until_ready(obs)
     
-    total_bytes = obs.nbytes + actions.nbytes + results.nbytes
+    total_bytes = obs.nbytes + actions.nbytes + targets.nbytes
     print(f"✓ Data in VRAM: {total_bytes / (1024**3):.2f} GB")
-    print(f"   Shape: {obs.shape} | dtype: {obs.dtype}")
+    print(f"   Shape: {obs.shape}")
     
-    return obs, actions, results
+    return obs, actions, targets
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GPU TRAINING (100% GPU - ZERO CPU)
+# GPU TRAINING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @partial(jax.jit, static_argnames=['batch_size'])
-def sample_batch(key, obs, actions, results, batch_size):
-    """Sample batch from GPU (no CPU transfer)."""
+def sample_batch(key, obs, actions, targets, batch_size):
     n = obs.shape[0]
     indices = jax.random.choice(key, n, shape=(batch_size,), replace=False)
-    return obs[indices], actions[indices], results[indices]
+    return obs[indices], actions[indices], targets[indices]
 
 
 @jax.jit
-def train_step(state, obs, actions, results):
-    """
-    Training step - 100% on GPU.
-    
-    Handles Int8 quantized observations (dequantizes to float32).
-    """
+def train_step(state, obs, actions, targets):
     def loss_fn(params):
-        # Dequantize Int8 observations if needed
-        if obs.dtype == jnp.int8:
-            obs_float = obs.astype(jnp.float32) / 127.0
-            # Pad to 119 channels for model compatibility
-            obs_padded = jnp.pad(obs_float, ((0, 0), (0, 0), (0, 0), (0, 119 - obs_float.shape[-1])))
-        else:
-            obs_padded = obs
-        
-        policy_logits, values, _ = state.apply_fn(params, obs_padded)
+        policy_logits, values, _ = state.apply_fn(params, obs)
         values = jnp.squeeze(values, -1)
         
-        # Cast results to float32 if needed (may be float16)
-        results_f32 = results.astype(jnp.float32)
-        
-        # Policy loss (cross-entropy)
         log_probs = jax.nn.log_softmax(policy_logits)
         one_hot = jax.nn.one_hot(actions, policy_logits.shape[-1])
         policy_loss = -jnp.mean(jnp.sum(log_probs * one_hot, axis=-1))
         
-        # Value loss (MSE)
-        value_loss = jnp.mean((values - results_f32) ** 2)
+        value_loss = jnp.mean((values - targets) ** 2)
         
-        # Accuracy
         predicted = jnp.argmax(policy_logits, axis=-1)
         accuracy = jnp.mean(predicted == actions)
         
@@ -562,14 +365,13 @@ def train_step(state, obs, actions, results):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--month', default='2019-09', help='Database month (YYYY-MM)')
-    # INCREASED DEFAULTS for better training
-    parser.add_argument('--games', type=int, default=100000, help='Max games')
-    parser.add_argument('--positions', type=int, default=1000000, help='Max positions')
-    parser.add_argument('--steps', type=int, default=20000, help='Training steps')
-    parser.add_argument('--batch_size', type=int, default=4096, help='Batch size')
-    parser.add_argument('--max_gb', type=float, default=1.0, help='Max download GB')
-    parser.add_argument('--output', default='lichess_model.pkl', help='Output path')
+    parser.add_argument('--month', default='2019-09')
+    parser.add_argument('--games', type=int, default=50000, help='Max games')
+    parser.add_argument('--positions', type=int, default=500000, help='Max positions')
+    parser.add_argument('--steps', type=int, default=10000, help='Training steps')
+    parser.add_argument('--batch_size', type=int, default=2048, help='Batch size')
+    parser.add_argument('--max_gb', type=float, default=1.0)
+    parser.add_argument('--output', default='lichess_model.pkl')
     args = parser.parse_args()
     
     start_total = time.time()
@@ -581,47 +383,32 @@ def main():
     print(f"  Games: {args.games:,} | Positions: {args.positions:,}")
     print(f"  Steps: {args.steps:,} | Batch: {args.batch_size:,}")
     
-    # 1. Download
+    # Download
     print()
     print("=" * 60)
     print("DOWNLOAD")
     print("=" * 60)
-    
     db_path = get_lichess_database(args.month, args.max_gb)
     
-    # 2. Extract games
+    # Collect positions (memory efficient)
     print()
     print("=" * 60)
-    print("EXTRACTION (CPU)")
+    print("PARSING (Memory Efficient)")
     print("=" * 60)
+    obs_np, actions_np, targets_np = collect_positions(db_path, args.games, args.positions)
     
-    games = extract_games_fast(db_path, args.games)
-    
-    if not games:
-        print("No games found, using sample data...")
-        games = ["1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 1-0"] * 1000
-    
-    # 3. Parse to positions
-    print()
-    print("=" * 60)
-    print("PARSING (CPU)")
-    print("=" * 60)
-    
-    all_obs, all_actions, all_results = parallel_parse_games(games, args.positions)
-    
-    # 4. Load to GPU
+    # Load to GPU
     print()
     print("=" * 60)
     print("GPU LOADING")
     print("=" * 60)
-    
-    obs, actions, results = load_to_gpu(all_obs, all_actions, all_results)
+    obs, actions, targets = load_to_gpu(obs_np, actions_np, targets_np)
     
     # Free CPU memory
-    del all_obs, all_actions, all_results, games
-    import gc; gc.collect()
+    del obs_np, actions_np, targets_np
+    gc.collect()
     
-    # 5. Initialize model
+    # Model
     print()
     print("=" * 60)
     print("MODEL INIT")
@@ -631,7 +418,6 @@ def main():
     from flax.training import train_state
     
     agent = RecurseZeroAgentSimple(num_actions=4672)
-    
     key = jax.random.PRNGKey(42)
     dummy = jnp.zeros((1, 8, 8, 119))
     key, init_key = jax.random.split(key)
@@ -640,10 +426,7 @@ def main():
     param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"✓ Model: {param_count:,} parameters")
     
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=1e-3)
-    )
+    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate=1e-3))
     
     class TrainState(train_state.TrainState):
         pass
@@ -652,44 +435,37 @@ def main():
     
     # JIT warmup
     key, batch_key = jax.random.split(key)
-    b_obs, b_act, b_res = sample_batch(batch_key, obs, actions, results, args.batch_size)
-    state, _ = train_step(state, b_obs, b_act, b_res)
+    b_obs, b_act, b_tgt = sample_batch(batch_key, obs, actions, targets, args.batch_size)
+    state, _ = train_step(state, b_obs, b_act, b_tgt)
     jax.block_until_ready(state.step)
     print("✓ JIT compiled")
     
-    # 6. Training (100% GPU)
+    # Training
     print()
     print("=" * 60)
     print(f"TRAINING ({args.steps:,} steps) - 100% GPU")
     print("=" * 60)
+    print(f"   {format_gpu_stats()}")
     print()
     
     train_start = time.time()
     
-    # Show initial GPU status
-    print(f"   {format_gpu_stats()}")
-    print()
-    
     with tqdm(total=args.steps, desc="Training", unit="step") as pbar:
         for step in range(args.steps):
             key, batch_key = jax.random.split(key)
-            b_obs, b_act, b_res = sample_batch(batch_key, obs, actions, results, args.batch_size)
-            state, metrics = train_step(state, b_obs, b_act, b_res)
+            b_obs, b_act, b_tgt = sample_batch(batch_key, obs, actions, targets, args.batch_size)
+            state, metrics = train_step(state, b_obs, b_act, b_tgt)
             
             if step % 100 == 0:
                 jax.block_until_ready(metrics['total_loss'])
                 elapsed = time.time() - train_start
                 speed = (step + 1) / elapsed if elapsed > 0 else 0
                 gpu = format_gpu_stats()
-                pbar.set_postfix_str(
-                    f"loss={float(metrics['total_loss']):.3f} | "
-                    f"acc={float(metrics['accuracy']):.1%} | "
-                    f"{speed:.0f}s/s | {gpu}"
-                )
+                pbar.set_postfix_str(f"loss={float(metrics['total_loss']):.3f} | acc={float(metrics['accuracy']):.1%} | {speed:.0f}s/s | {gpu}")
             
             pbar.update(1)
     
-    # 7. Save
+    # Save
     print()
     print("=" * 60)
     print("💾 SAVING")
@@ -699,14 +475,11 @@ def main():
     export_for_inference(state.params, args.output)
     
     total_time = time.time() - start_total
-    train_time = time.time() - train_start
-    
     print()
     print("=" * 60)
     print("✅ COMPLETE")
     print("=" * 60)
     print(f"  Total time: {total_time:.0f}s ({total_time/60:.1f} min)")
-    print(f"  Train time: {train_time:.0f}s")
     print(f"  Final accuracy: {float(metrics['accuracy']):.1%}")
     print(f"  Model: {args.output}")
     print()
