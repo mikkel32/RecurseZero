@@ -78,16 +78,8 @@ def resident_train_step(
     obs = env_state.observation
     current_player = env_state.current_player
     
-    # Cast to BFloat16 for mixed precision (if enabled)
-    obs_compute = cast_to_compute(obs)
-    
-    # Forward pass
-    policy_logits, values, reward_pred = agent_apply_fn(state.params, obs_compute)
-    
-    # Ensure outputs are FP32 for loss computation
-    policy_logits = cast_to_output(policy_logits)
-    values = cast_to_output(values)
-    reward_pred = cast_to_output(reward_pred)
+    # Forward pass (model handles BF16 casting internally)
+    policy_logits, values, reward_pred = agent_apply_fn(state.params, obs)
     
     # Get legal action mask
     legal_mask = env_state.legal_action_mask

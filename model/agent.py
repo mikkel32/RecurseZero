@@ -1,3 +1,15 @@
+"""
+RecurseZero Agent with BFloat16 Mixed Precision.
+
+Per GPU ONLY Chess RL Agent.txt spec:
+- DEQ core with Anderson Acceleration
+- GTrXL stabilization
+- Chess-aware positional encodings
+- Muesli policy head (search-free)
+- PVE value/reward heads
+- BFloat16 for 2x memory savings and faster compute
+"""
+
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -6,50 +18,45 @@ from .universal_transformer import UniversalTransformerBlock
 from algorithm.muesli import PolicyHead
 from algorithm.pve import ValueHead, RewardHead
 
+# Get compute dtype
+try:
+    from optimization.mixed_precision import get_dtype, is_bf16_enabled
+except ImportError:
+    def get_dtype():
+        return jnp.float32
+    def is_bf16_enabled():
+        return False
+
+
 class RecurseZeroAgent(nn.Module):
     """
-    The full RecurseZero Agent.
-    
-    Per GPU ONLY Chess RL Agent.txt spec:
-    - DEQ core with Anderson Acceleration
-    - GTrXL stabilization
-    - Chess-aware positional encodings
-    - Muesli policy head (search-free)
-    - PVE value/reward heads
-    - Int8 quantization (when enabled)
+    Full RecurseZero Agent with BFloat16 mixed precision.
     
     Structure:
     Input (Board) -> Embedding -> DEQ -> Abstract State z*
     z* -> Policy Head -> Logits
     z* -> Value Head -> V(s)
     z* -> Reward Head -> R(s)
-    
-    Complexity metrics available via mutable='intermediates':
-    - final_residual: Per-sample DEQ convergence
-    - attention_weights: Per-head attention maps
-    - attention_entropy: Measure of attention confidence
     """
-    # SPEC-COMPLIANT DEFAULTS
-    hidden_dim: int = 256  # Full size per spec
-    heads: int = 8         # More heads for chess patterns
-    mlp_dim: int = 1024    # Full MLP size
+    hidden_dim: int = 256
+    heads: int = 8
+    mlp_dim: int = 1024
     num_actions: int = 4672
-    
-    # DEQ PARAMETERS
-    deq_iters: int = 8     # Increased for better convergence
-    deq_tol: float = 1e-3  # Early exit tolerance
-    deq_beta: float = 0.9  # Anderson damping
-    deq_m: int = 3         # History size (2x2 solve)
+    deq_iters: int = 8
+    deq_tol: float = 1e-3
+    deq_beta: float = 0.9
+    deq_m: int = 3
     
     @nn.compact
     def __call__(self, x):
-        # x: Input observation using Pgx encoding (Batch, 8, 8, C)
+        # Get compute dtype (BF16 or FP32)
+        compute_dtype = get_dtype()
         
-        # 1. Input Embedding
-        # Project 8x8xC to 8x8xDim
-        x_embed = nn.Dense(self.hidden_dim, name='input_embed')(x)
+        # Cast input to compute dtype
+        x = x.astype(compute_dtype)
         
-        # Flatten for Transformer: (Batch, 64, Dim)
+        # 1. Input Embedding (in BF16)
+        x_embed = nn.Dense(self.hidden_dim, dtype=compute_dtype, name='input_embed')(x)
         x_flat = x_embed.reshape(x_embed.shape[0], -1, self.hidden_dim)
         
         # 2. DEQ Core
@@ -58,7 +65,8 @@ class RecurseZeroAgent(nn.Module):
             block_args={
                 'hidden_dim': self.hidden_dim,
                 'heads': self.heads,
-                'mlp_dim': self.mlp_dim
+                'mlp_dim': self.mlp_dim,
+                'dtype': compute_dtype,  # Pass dtype to block
             },
             max_iter=self.deq_iters,
             tol=self.deq_tol,
@@ -69,38 +77,21 @@ class RecurseZeroAgent(nn.Module):
         
         z_star = deq(x_flat)
         
-        # 3. Output Heads
-        # Mean pooling over the 64 squares
-        z_pooled = jnp.mean(z_star, axis=1)  # (Batch, Dim)
+        # 3. Output Heads (cast back to FP32 for stability)
+        z_pooled = jnp.mean(z_star, axis=1).astype(jnp.float32)
         
-        # Policy: Direct move probabilities (Muesli, search-free)
-        policy_logits = PolicyHead(
-            self.hidden_dim, 
-            self.num_actions,
-            name='policy'
-        )(z_pooled)
-        
-        # Value: Win probability prediction
-        value = ValueHead(
-            self.hidden_dim,
-            name='value'
-        )(z_pooled)
-        
-        # Reward: Immediate reward prediction (PVE)
-        reward = RewardHead(
-            self.hidden_dim,
-            name='reward'
-        )(z_pooled)
+        policy_logits = PolicyHead(self.hidden_dim, self.num_actions, name='policy')(z_pooled)
+        value = ValueHead(self.hidden_dim, name='value')(z_pooled)
+        reward = RewardHead(self.hidden_dim, name='reward')(z_pooled)
         
         return policy_logits, value, reward
 
 
 class RecurseZeroAgentFast(nn.Module):
     """
-    Speed-optimized version for L4 GPU (24GB).
+    Speed-optimized version with BFloat16 for L4 GPU.
     
-    Reduced parameters for faster training while maintaining
-    the core architecture.
+    Reduced parameters + BF16 = maximum throughput.
     """
     hidden_dim: int = 128
     heads: int = 4
@@ -113,15 +104,24 @@ class RecurseZeroAgentFast(nn.Module):
     
     @nn.compact
     def __call__(self, x):
-        x_embed = nn.Dense(self.hidden_dim, name='input_embed')(x)
+        # Get compute dtype (BF16 or FP32)
+        compute_dtype = get_dtype()
+        
+        # Cast input
+        x = x.astype(compute_dtype)
+        
+        # 1. Embedding
+        x_embed = nn.Dense(self.hidden_dim, dtype=compute_dtype, name='input_embed')(x)
         x_flat = x_embed.reshape(x_embed.shape[0], -1, self.hidden_dim)
         
+        # 2. DEQ Core with BF16
         deq = DeepEquilibriumModel(
             block_class=UniversalTransformerBlock,
             block_args={
                 'hidden_dim': self.hidden_dim,
                 'heads': self.heads,
-                'mlp_dim': self.mlp_dim
+                'mlp_dim': self.mlp_dim,
+                'dtype': compute_dtype,
             },
             max_iter=self.deq_iters,
             tol=self.deq_tol,
@@ -131,7 +131,9 @@ class RecurseZeroAgentFast(nn.Module):
         )
         
         z_star = deq(x_flat)
-        z_pooled = jnp.mean(z_star, axis=1)
+        
+        # 3. Output Heads (FP32)
+        z_pooled = jnp.mean(z_star, axis=1).astype(jnp.float32)
         
         policy_logits = PolicyHead(self.hidden_dim, self.num_actions, name='policy')(z_pooled)
         value = ValueHead(self.hidden_dim, name='value')(z_pooled)
