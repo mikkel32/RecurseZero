@@ -6,14 +6,14 @@ from functools import partial
 
 # --- OPTIMIZED ANDERSON ACCELERATION ---
 
-def anderson_acceleration(f, z_init, max_iter, tol=1e-4, m=3, beta=0.8, lam=1e-4):
+def anderson_acceleration(f, z_init, max_iter, tol=1e-4, m=2, beta=0.9, lam=1e-4):
     """
     Solves z = f(z) using Anderson Acceleration (Type II).
     
-    OPTIMIZED VERSION:
-    - Reduced history size m=3 (from 5) for less memory
-    - Higher damping beta=0.8 for faster convergence
-    - Uses jax.lax.fori_loop for efficient compilation
+    SPEED OPTIMIZED:
+    - Default m=2 (1x1 solve, fastest)
+    - Higher damping beta=0.9
+    - Uses jax.lax.fori_loop for XLA efficiency
     """
     batch_size = z_init.shape[0]
     d = z_init.size // batch_size
@@ -21,63 +21,69 @@ def anderson_acceleration(f, z_init, max_iter, tol=1e-4, m=3, beta=0.8, lam=1e-4
     def step_fn(i, state):
         z, G_hist, Z_hist = state
         
-        # Evaluate f(z)
         f_z = f(z)
         g = f_z - z
         
         z_flat = z.reshape(batch_size, -1)
         g_flat = g.reshape(batch_size, -1)
         
-        # Update history (circular buffer via roll)
+        # Update history
         G_hist = jnp.roll(G_hist, 1, axis=1)
         Z_hist = jnp.roll(Z_hist, 1, axis=1)
         G_hist = G_hist.at[:, 0, :].set(g_flat)
         Z_hist = Z_hist.at[:, 0, :].set(z_flat)
         
-        # Early iterations: use simple damped iteration
         def simple_update(_):
             return z_flat + beta * g_flat
         
-        # Anderson mixing after warmup
         def anderson_update(_):
             current_g = G_hist[:, 0, :]
-            prev_G = G_hist[:, 1:, :]  # (B, m-1, d)
+            prev_G = G_hist[:, 1:, :]
             current_z = Z_hist[:, 0, :]
             prev_Z = Z_hist[:, 1:, :]
             
-            DG = current_g[:, None, :] - prev_G  # (B, m-1, d)
+            DG = current_g[:, None, :] - prev_G
             DZ = current_z[:, None, :] - prev_Z
             
-            # Solve for gamma using Gram matrix (small m-1 x m-1 system)
-            # (DG^T DG + λI) γ = DG^T g
-            DG_t = jnp.transpose(DG, (0, 2, 1))  # (B, d, m-1)
-            gram = jnp.matmul(jnp.transpose(DG_t, (0, 2, 1)), DG_t)  # (B, m-1, m-1)
-            gram = gram + lam * jnp.eye(m-1)[None, :, :]
+            # For m=2: 1x1 solve (scalar division)
+            # For m=3: 2x2 solve
+            if m == 2:
+                # Simple 1x1: gamma = (DG^T g) / (DG^T DG + λ)
+                DG_0 = DG[:, 0, :]  # (B, d)
+                DZ_0 = DZ[:, 0, :]
+                
+                numerator = jnp.sum(DG_0 * current_g, axis=-1)  # (B,)
+                denominator = jnp.sum(DG_0 * DG_0, axis=-1) + lam  # (B,)
+                gamma = numerator / denominator  # (B,)
+                
+                correction = gamma[:, None] * (DZ_0 + beta * DG_0)
+            else:
+                # 2x2 system for m=3
+                DG_t = jnp.transpose(DG, (0, 2, 1))
+                gram = jnp.matmul(jnp.transpose(DG_t, (0, 2, 1)), DG_t)
+                gram = gram + lam * jnp.eye(m-1)[None, :, :]
+                
+                rhs = jnp.matmul(jnp.transpose(DG_t, (0, 2, 1)), current_g[:, :, None])
+                
+                a, b = gram[:, 0, 0], gram[:, 0, 1]
+                c, d_ = gram[:, 1, 0], gram[:, 1, 1]
+                det = a * d_ - b * c + 1e-8
+                
+                r0, r1 = rhs[:, 0, 0], rhs[:, 1, 0]
+                gamma0 = (d_ * r0 - b * r1) / det
+                gamma1 = (-c * r0 + a * r1) / det
+                gamma = jnp.stack([gamma0, gamma1], axis=1)[:, :, None]
+                
+                correction = jnp.sum(gamma * (DZ + beta * DG), axis=1)
             
-            rhs = jnp.matmul(jnp.transpose(DG_t, (0, 2, 1)), current_g[:, :, None])  # (B, m-1, 1)
-            
-            # Solve 2x2 system directly (m=3 -> m-1=2)
-            a, b = gram[:, 0, 0], gram[:, 0, 1]
-            c, d = gram[:, 1, 0], gram[:, 1, 1]
-            det = a * d - b * c + 1e-8
-            
-            r0, r1 = rhs[:, 0, 0], rhs[:, 1, 0]
-            gamma0 = (d * r0 - b * r1) / det
-            gamma1 = (-c * r0 + a * r1) / det
-            gamma = jnp.stack([gamma0, gamma1], axis=1)[:, :, None]  # (B, 2, 1)
-            
-            # Compute correction
-            correction = jnp.sum(gamma * (DZ + beta * DG), axis=1)  # (B, d)
             z_new = (z_flat + beta * current_g) - correction
             return z_new
         
-        # Use Anderson after m iterations, simple before
         z_new_flat = jax.lax.cond(i < m, simple_update, anderson_update, None)
         z_new = z_new_flat.reshape(z.shape)
         
         return (z_new, G_hist, Z_hist)
     
-    # Initialize
     Z_hist = jnp.zeros((batch_size, m, d))
     G_hist = jnp.zeros((batch_size, m, d))
     
