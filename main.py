@@ -1,35 +1,65 @@
+#!/usr/bin/env python3
+"""
+RecurseZero: GPU-Resident Chess RL Agent
+Main training script with live progress monitoring.
+"""
+
+print("=" * 60)
+print("🧠 RecurseZero - Starting...")
+print("=" * 60)
+print()
+
+import sys
+import time
+
+# Try to import rich for beautiful output, fallback to plain print
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+    from rich import box
+    RICH_AVAILABLE = True
+    console = Console()
+    print("✓ Rich library loaded")
+except ImportError:
+    RICH_AVAILABLE = False
+    print("⚠ Rich not installed - using plain output")
+    print("  Install with: pip install rich")
+
+print("Loading JAX...", flush=True)
 import jax
 import jax.numpy as jnp
+print(f"✓ JAX loaded (backend: {jax.default_backend()})", flush=True)
+
+print("Loading Optax...", flush=True)
 import optax
+print("✓ Optax loaded", flush=True)
+
+print("Loading environment...", flush=True)
 from env.pgx_wrapper import RecurseEnv
+print("✓ Environment loaded", flush=True)
+
+print("Loading model...", flush=True)
 from model.agent import RecurseZeroAgent
+print("✓ Model loaded", flush=True)
+
+print("Loading training loop...", flush=True)
 from training.loop import TrainState, resident_train_step
+print("✓ Training loop loaded", flush=True)
+
+print("Loading hardware config...", flush=True)
 from optimization.hardware_compat import setup_jax_platform
-import time
+print("✓ Hardware config loaded", flush=True)
+
 import subprocess
-import sys
-
-# Rich imports for beautiful live dashboard
-from rich.console import Console
-from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
-from rich.layout import Layout
-from rich.text import Text
-from rich import box
-
-console = Console()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GPU MONITORING UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_gpu_stats():
-    """
-    Get GPU statistics using nvidia-smi (works on Colab/CUDA).
-    Returns dict with utilization, memory, temperature.
-    """
+    """Get GPU statistics using nvidia-smi (works on Colab/CUDA)."""
     try:
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu', 
@@ -47,145 +77,145 @@ def get_gpu_stats():
                 }
     except Exception:
         pass
-    
-    # Fallback for non-NVIDIA systems (MPS, etc.)
-    return {
-        'gpu_util': -1,
-        'mem_used': -1,
-        'mem_total': -1,
-        'temp': -1,
-    }
+    return {'gpu_util': -1, 'mem_used': -1, 'mem_total': -1, 'temp': -1}
 
-def create_gpu_panel(stats):
-    """Create a Rich panel displaying GPU statistics."""
+def format_gpu_str(stats):
+    """Format GPU stats as a string."""
     if stats['gpu_util'] < 0:
-        # No GPU stats available
-        return Panel("[dim]GPU stats unavailable (Metal/MPS)[/dim]", 
-                     title="🔧 GPU", border_style="dim")
-    
-    util_color = "green" if stats['gpu_util'] > 50 else "yellow" if stats['gpu_util'] > 10 else "red"
-    temp_color = "green" if stats['temp'] < 70 else "yellow" if stats['temp'] < 85 else "red"
-    
-    mem_pct = (stats['mem_used'] / stats['mem_total']) * 100 if stats['mem_total'] > 0 else 0
-    mem_color = "green" if mem_pct < 70 else "yellow" if mem_pct < 90 else "red"
-    
-    text = Text()
-    text.append(f"⚡ Utilization: ", style="bold")
-    text.append(f"{stats['gpu_util']:3d}%\n", style=util_color)
-    text.append(f"💾 VRAM: ", style="bold")
-    text.append(f"{stats['mem_used']:,} / {stats['mem_total']:,} MB ", style=mem_color)
-    text.append(f"({mem_pct:.1f}%)\n", style=mem_color)
-    text.append(f"🌡️  Temp: ", style="bold")
-    text.append(f"{stats['temp']}°C", style=temp_color)
-    
-    return Panel(text, title="🎮 GPU Status", border_style="cyan")
-
-def create_metrics_table(metrics, step, steps_per_sec, total_steps):
-    """Create a Rich table displaying training metrics."""
-    table = Table(box=box.ROUNDED, border_style="green", title="📊 Training Metrics")
-    
-    table.add_column("Metric", style="cyan", justify="right")
-    table.add_column("Value", style="white", justify="left")
-    
-    table.add_row("Step", f"{step} / {total_steps}")
-    table.add_row("Steps/sec", f"{steps_per_sec:.2f}")
-    table.add_row("─" * 15, "─" * 20)
-    table.add_row("Total Loss", f"{metrics.get('total_loss', 0):.4f}")
-    table.add_row("Policy Loss", f"{metrics.get('pg_loss', 0):.4f}")
-    table.add_row("PVE Loss", f"{metrics.get('pve_loss', 0):.4f}")
-    table.add_row("─" * 15, "─" * 20)
-    table.add_row("Mean Reward", f"{metrics.get('mean_reward', 0):.4f}")
-    table.add_row("Policy Entropy", f"{metrics.get('policy_entropy', 0):.2f}")
-    
-    # Win probability from value (v in [-1, 1] -> P(win) = (v+1)/2)
-    mean_val = float(metrics.get('mean_value', 0))
-    win_prob = (mean_val + 1) / 2 * 100
-    table.add_row("Win Probability", f"{win_prob:.1f}%")
-    
-    return table
+        return "(GPU stats unavailable)"
+    return f"GPU: {stats['gpu_util']}% | VRAM: {stats['mem_used']}/{stats['mem_total']}MB | {stats['temp']}°C"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN TRAINING LOOP
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    console.print(Panel.fit(
-        "[bold cyan]🧠 RecurseZero[/bold cyan]\n"
-        "[dim]GPU-Resident Chess RL Agent with DEQ[/dim]",
-        border_style="cyan"
-    ))
+    print()
+    print("=" * 60)
+    print("INITIALIZATION")
+    print("=" * 60)
     
     setup_jax_platform()
     
-    # Apply Metal Patch for Pgx (Simulate GPU-Safe Hashing)
+    # Apply Metal Patch for Pgx
+    print("Applying Pgx patches...", flush=True)
     from env.pgx_patch import apply_patch
     apply_patch()
     
     # 1. Initialize Environment
     BATCH_SIZE = 2048 
+    print(f"Initializing environment (batch_size={BATCH_SIZE})...", flush=True)
     env = RecurseEnv(batch_size=BATCH_SIZE)
     key = jax.random.PRNGKey(42)
     key, env_key = jax.random.split(key)
     
-    # Initialize env state on GPU
     env_state = env.init(env_key)
-    console.print(f"[green]✓[/green] Environment: Batch={BATCH_SIZE}, Actions={env.num_actions}")
+    print(f"✓ Environment: Batch={BATCH_SIZE}, Actions={env.num_actions}", flush=True)
     
     # 2. Initialize Model
+    print("Initializing model...", flush=True)
     agent = RecurseZeroAgent(num_actions=env.num_actions)
     dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
     
     key, init_key = jax.random.split(key)
     params = agent.init(init_key, dummy_obs)
+    print("✓ Model initialized", flush=True)
     
     # 3. Optimizer Setup
+    print("Setting up optimizer...", flush=True)
     optimizer = optax.adamw(learning_rate=3e-4)
     train_state = TrainState.create(
         apply_fn=agent.apply,
         params=params,
         tx=optimizer
     )
-    console.print("[green]✓[/green] Model and Optimizer initialized")
+    print("✓ Optimizer ready", flush=True)
     
     # 4. JIT Warmup (Critical for avoiding "stuck" appearance)
-    console.print()
-    with console.status("[bold yellow]⚙️  JIT Compiling XLA kernels (this takes 1-3 min)...[/bold yellow]", spinner="dots"):
-        key, warmup_key = jax.random.split(key)
-        warmup_start = time.time()
-        
-        # Run one step to trigger compilation
-        train_state, env_state, warmup_metrics = resident_train_step(
-            train_state, env_state, warmup_key, agent.apply, env.step
-        )
-        # Block until compilation is complete
-        jax.block_until_ready(warmup_metrics['total_loss'])
-        
-        warmup_time = time.time() - warmup_start
+    print()
+    print("=" * 60)
+    print("⚙️  JIT COMPILING (this takes 1-3 minutes, please wait...)")
+    print("=" * 60)
+    print()
     
-    console.print(f"[green]✓[/green] JIT Compilation complete in [cyan]{warmup_time:.1f}s[/cyan]")
-    console.print()
+    key, warmup_key = jax.random.split(key)
+    warmup_start = time.time()
     
-    # 5. Training Loop with Live Dashboard
+    # Show we're alive during compilation
+    print("Compiling XLA kernels...", flush=True)
+    train_state, env_state, warmup_metrics = resident_train_step(
+        train_state, env_state, warmup_key, agent.apply, env.step
+    )
+    # Block until compilation is complete
+    jax.block_until_ready(warmup_metrics['total_loss'])
+    
+    warmup_time = time.time() - warmup_start
+    print(f"✓ JIT Compilation complete in {warmup_time:.1f}s", flush=True)
+    
+    # Show GPU stats after compilation
+    gpu_stats = get_gpu_stats()
+    print(f"  {format_gpu_str(gpu_stats)}", flush=True)
+    
+    # 5. Training Loop
     NUM_STEPS = 50
     step_fn = resident_train_step
-    
-    # Tracking
     step_times = []
-    current_metrics = warmup_metrics
     
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(bar_width=40),
-        TaskProgressColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        expand=True
-    ) as progress:
-        
-        train_task = progress.add_task("[cyan]Training...", total=NUM_STEPS)
-        
+    print()
+    print("=" * 60)
+    print(f"TRAINING ({NUM_STEPS} steps)")
+    print("=" * 60)
+    print()
+    
+    if RICH_AVAILABLE:
+        # Use Rich progress bar
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            expand=True
+        ) as progress:
+            
+            train_task = progress.add_task("[cyan]Training...", total=NUM_STEPS)
+            
+            for i in range(NUM_STEPS):
+                step_start = time.time()
+                
+                key, step_key = jax.random.split(key)
+                train_state, env_state, metrics = step_fn(
+                    train_state, env_state, step_key, agent.apply, env.step
+                )
+                
+                jax.block_until_ready(metrics['total_loss'])
+                step_time = time.time() - step_start
+                step_times.append(step_time)
+                
+                recent_times = step_times[-10:]
+                avg_step_time = sum(recent_times) / len(recent_times)
+                steps_per_sec = 1.0 / avg_step_time if avg_step_time > 0 else 0
+                
+                progress.update(train_task, advance=1)
+                
+                if i % 10 == 0 or i == NUM_STEPS - 1:
+                    gpu_stats = get_gpu_stats()
+                    loss_val = float(metrics['total_loss'])
+                    reward_val = float(metrics['mean_reward'])
+                    entropy_val = float(metrics.get('policy_entropy', 0))
+                    
+                    progress.console.print(
+                        f"  Step {i:3d} │ "
+                        f"Loss: {loss_val:7.4f} │ "
+                        f"Reward: {reward_val:6.3f} │ "
+                        f"Entropy: {entropy_val:5.2f} │ "
+                        f"{steps_per_sec:.1f} steps/s │ "
+                        f"{format_gpu_str(gpu_stats)}"
+                    )
+    else:
+        # Plain output fallback
         for i in range(NUM_STEPS):
             step_start = time.time()
             
@@ -194,61 +224,50 @@ def main():
                 train_state, env_state, step_key, agent.apply, env.step
             )
             
-            # Block to get accurate timing
             jax.block_until_ready(metrics['total_loss'])
             step_time = time.time() - step_start
             step_times.append(step_time)
-            current_metrics = metrics
             
-            # Calculate steps/sec (rolling average of last 10)
             recent_times = step_times[-10:]
             avg_step_time = sum(recent_times) / len(recent_times)
             steps_per_sec = 1.0 / avg_step_time if avg_step_time > 0 else 0
             
-            # Update progress
-            progress.update(train_task, advance=1)
-            
-            # Print metrics periodically
-            if i % 10 == 0 or i == NUM_STEPS - 1:
+            # Print every step for visibility
+            if i % 5 == 0 or i == NUM_STEPS - 1:
                 gpu_stats = get_gpu_stats()
-                
-                # Build status line
                 loss_val = float(metrics['total_loss'])
                 reward_val = float(metrics['mean_reward'])
-                entropy_val = float(metrics['policy_entropy'])
+                entropy_val = float(metrics.get('policy_entropy', 0))
                 
-                gpu_str = ""
-                if gpu_stats['gpu_util'] >= 0:
-                    gpu_str = f" | GPU: {gpu_stats['gpu_util']}% | VRAM: {gpu_stats['mem_used']}/{gpu_stats['mem_total']}MB | {gpu_stats['temp']}°C"
+                eta = avg_step_time * (NUM_STEPS - i - 1)
                 
-                progress.console.print(
-                    f"  [dim]Step {i:3d}[/dim] │ "
-                    f"Loss: [yellow]{loss_val:7.4f}[/yellow] │ "
-                    f"Reward: [cyan]{reward_val:6.3f}[/cyan] │ "
-                    f"Entropy: [magenta]{entropy_val:5.2f}[/magenta] │ "
-                    f"[green]{steps_per_sec:.1f} steps/s[/green]"
-                    f"[dim]{gpu_str}[/dim]"
+                print(
+                    f"Step {i:3d}/{NUM_STEPS} │ "
+                    f"Loss: {loss_val:7.4f} │ "
+                    f"Reward: {reward_val:6.3f} │ "
+                    f"Entropy: {entropy_val:5.2f} │ "
+                    f"{steps_per_sec:.1f} steps/s │ "
+                    f"ETA: {eta:.0f}s │ "
+                    f"{format_gpu_str(gpu_stats)}",
+                    flush=True
                 )
     
     # Final Summary
     total_time = sum(step_times)
     avg_steps_per_sec = NUM_STEPS / total_time if total_time > 0 else 0
     
-    console.print()
-    console.print(Panel.fit(
-        f"[bold green]✓ Training Complete![/bold green]\n\n"
-        f"  Steps: {NUM_STEPS}\n"
-        f"  Time: {total_time:.1f}s (+ {warmup_time:.1f}s compile)\n"
-        f"  Speed: {avg_steps_per_sec:.2f} steps/sec\n"
-        f"  Final Loss: {float(current_metrics['total_loss']):.4f}",
-        title="📈 Summary",
-        border_style="green"
-    ))
+    print()
+    print("=" * 60)
+    print("✓ TRAINING COMPLETE!")
+    print("=" * 60)
+    print(f"  Steps:      {NUM_STEPS}")
+    print(f"  Time:       {total_time:.1f}s (+ {warmup_time:.1f}s compile)")
+    print(f"  Speed:      {avg_steps_per_sec:.2f} steps/sec")
+    print(f"  Final Loss: {float(metrics['total_loss']):.4f}")
     
-    # Final GPU stats
     gpu_stats = get_gpu_stats()
-    if gpu_stats['gpu_util'] >= 0:
-        console.print(create_gpu_panel(gpu_stats))
+    print(f"  {format_gpu_str(gpu_stats)}")
+    print()
 
 if __name__ == "__main__":
     main()
