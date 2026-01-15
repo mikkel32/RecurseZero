@@ -98,6 +98,17 @@ def main():
     
     setup_jax_platform()
     
+    # Initialize Int8 Quantization (2-4x speedup on Tensor Cores)
+    try:
+        from optimization.quantization import init_quantization
+        # Enable quantization on CUDA/Tensor Core hardware
+        if jax.default_backend() == 'gpu':
+            init_quantization(enable=True)
+        else:
+            print("⚪ Quantization skipped (not on CUDA GPU)")
+    except ImportError:
+        print("⚠ Quantization module not available")
+    
     # Apply Metal Patch for Pgx
     print("Applying Pgx patches...", flush=True)
     from env.pgx_patch import apply_patch

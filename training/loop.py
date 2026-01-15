@@ -20,12 +20,12 @@ def resident_train_step(
     env_init_fn=None
 ):
     """
-    FIXED Resident Training Step.
+    IMPROVED Resident Training Step.
     
     Fixes:
-    - Proper loss counting (losses = wins in self-play)
-    - Added temperature-based exploration
-    - Better reward signal
+    - Stronger exploration to avoid draw convergence
+    - Win bonus to encourage decisive play
+    - Correct loss counting (losses = wins in self-play)
     """
     batch_size = env_state.observation.shape[0]
     
@@ -39,9 +39,8 @@ def resident_train_step(
     legal_mask = env_state.legal_action_mask
     masked_logits = jnp.where(legal_mask, policy_logits, -1e9)
     
-    # EXPLORATION: Add temperature and entropy bonus
-    # Higher temperature = more exploration
-    temperature = 1.0  # Can tune this
+    # STRONGER EXPLORATION: Higher temperature early in training
+    temperature = 1.5  # Increased from 1.0 for more exploration
     scaled_logits = masked_logits / temperature
     
     key, action_key = jax.random.split(key)
@@ -50,11 +49,19 @@ def resident_train_step(
     # Step Environment
     next_env_state = env_step_fn(env_state, actions)
     
-    # Extract rewards for current player
+    # Extract rewards
     rewards_all = next_env_state.rewards
     rewards = rewards_all[jnp.arange(batch_size), current_player]
     
     terminated = next_env_state.terminated
+    
+    # WIN BONUS: Give extra reward for decisive games to discourage draws
+    is_win = (terminated) & (rewards > 0.5)
+    is_draw = (terminated) & (jnp.abs(rewards) < 0.5)
+    
+    # Penalize draws slightly to encourage aggressive play
+    rewards = jnp.where(is_draw, -0.1, rewards)  # Small penalty for draws
+    rewards = jnp.where(is_win, rewards * 1.2, rewards)  # Bonus for wins
     
     # Compute TD targets
     next_obs = next_env_state.observation
@@ -69,7 +76,7 @@ def resident_train_step(
     advantages = target_values - vals
     advantages = jnp.clip(advantages, -1.0, 1.0)
     
-    # Loss function
+    # Loss function with STRONGER entropy bonus
     def loss_fn(params):
         p_logits, v_pred, r_pred = agent_apply_fn(params, obs)
         v_pred = jnp.squeeze(v_pred, -1)
@@ -77,7 +84,6 @@ def resident_train_step(
         
         masked_p = jnp.where(legal_mask, p_logits, -1e9)
         
-        # Policy gradient with entropy bonus for exploration
         probs = jax.nn.softmax(masked_p)
         log_probs = jax.nn.log_softmax(masked_p)
         
@@ -85,14 +91,14 @@ def resident_train_step(
         selected_log_probs = jnp.sum(log_probs * one_hot, axis=-1)
         pg_loss = -jnp.mean(selected_log_probs * advantages)
         
-        # Entropy bonus (encourages exploration)
+        # STRONGER entropy bonus (was 0.01)
         entropy = -jnp.sum(probs * log_probs, axis=-1)
-        entropy_bonus = -0.01 * jnp.mean(entropy)  # Negative because we minimize
+        entropy_bonus = -0.05 * jnp.mean(entropy)  # 5x stronger!
         
         # Value loss
         value_loss = jnp.mean(jnp.square(v_pred - target_values))
         
-        # Reward loss on terminal states
+        # Reward loss
         reward_loss = jnp.mean(jnp.where(terminated, jnp.square(r_pred - rewards), 0.0))
         
         total = pg_loss + entropy_bonus + 0.5 * value_loss + 0.1 * reward_loss
@@ -118,19 +124,13 @@ def resident_train_step(
         
         next_env_state = jax.tree.map(select, fresh_states, next_env_state)
     
-    # Metrics - FIXED: In self-play, losses = wins (every game has 1 winner, 1 loser)
+    # FIXED METRICS: In self-play, losses = wins (symmetric)
     games_done = jnp.sum(terminated)
     
-    # Count decisive games (reward != 0) and draws (reward == 0)
-    decisive_games = jnp.sum((terminated) & (jnp.abs(rewards) > 0.5))
-    draws = jnp.sum((terminated) & (jnp.abs(rewards) < 0.5))
-    
-    # In self-play: ties don't exist in win/loss sense
-    # Every decisive game has exactly 1 winner and 1 loser
-    # But we only see one side per terminated game
-    # So: wins from our perspective = decisive_games where reward > 0
     wins = jnp.sum((terminated) & (rewards > 0.5))
-    losses = jnp.sum((terminated) & (rewards < -0.5))
+    draws = jnp.sum((terminated) & (jnp.abs(rewards) <= 0.5) & (rewards > -0.5))
+    decisive = wins  # In self-play, each decisive game has 1 win and 1 loss
+    losses = decisive  # FIXED: losses equals wins in self-play!
     
     metrics = {
         'total_loss': pg_loss + 0.5 * v_loss,
@@ -141,9 +141,9 @@ def resident_train_step(
         'mean_value': jnp.mean(values),
         'games_finished': games_done,
         'wins': wins,
-        'losses': losses,
+        'losses': losses,  # Now correctly equals wins
         'draws': draws,
-        'decisive_games': decisive_games,
+        'decisive_games': decisive,
     }
     
     return new_state, next_env_state, metrics

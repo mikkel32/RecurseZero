@@ -4,5 +4,5 @@ optax
 pgx
 rich>=13.0.0
 pynvml>=11.0.0
-aqt
+aqtp>=0.7.0
 jax-metal==0.1.1
