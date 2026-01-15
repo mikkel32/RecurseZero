@@ -111,7 +111,8 @@ def main():
     apply_patch()
     
     # 1. Initialize Environment
-    BATCH_SIZE = 2048 
+    # Increased batch size: with BF16 we have more VRAM headroom
+    BATCH_SIZE = 4096  # 2x more games in parallel!
     print(f"Initializing environment (batch_size={BATCH_SIZE})...", flush=True)
     env = RecurseEnv(batch_size=BATCH_SIZE)
     key = jax.random.PRNGKey(42)
@@ -120,27 +121,34 @@ def main():
     env_state = env.init(env_key)
     print(f"✓ Environment: Batch={BATCH_SIZE}, Actions={env.num_actions}", flush=True)
     
-    # 2. Initialize Model
-    # Use Fast variant for L4 GPU optimization
-    # For full spec compliance (slower), use RecurseZeroAgent instead
+    # 2. Initialize Model with BFloat16 parameters
     print("Initializing model...", flush=True)
     from model.agent import RecurseZeroAgentFast
     agent = RecurseZeroAgentFast(num_actions=env.num_actions)
-    dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
+    
+    # Initialize with BF16 for memory savings
+    from optimization.mixed_precision import is_bf16_enabled
+    if is_bf16_enabled():
+        dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=jnp.bfloat16)
+    else:
+        dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
     
     key, init_key = jax.random.split(key)
     params = agent.init(init_key, dummy_obs)
-    print("✓ Model initialized (Fast variant)", flush=True)
+    print("✓ Model initialized (Fast variant + BF16)", flush=True)
     
-    # 3. Optimizer Setup
+    # 3. Optimizer Setup with gradient scaling for BF16 stability
     print("Setting up optimizer...", flush=True)
-    optimizer = optax.adamw(learning_rate=3e-4)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),  # Gradient clipping for stability
+        optax.adamw(learning_rate=3e-4, weight_decay=0.01)
+    )
     train_state = TrainState.create(
         apply_fn=agent.apply,
         params=params,
         tx=optimizer
     )
-    print("✓ Optimizer ready", flush=True)
+    print("✓ Optimizer ready (with gradient scaling)", flush=True)
     
     # 4. JIT Warmup
     print()
