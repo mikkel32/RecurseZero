@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """
 RecurseZero: GPU-Resident Chess RL Agent
-Main training script with smart VRAM management.
 
-Features:
-- Automatic VRAM cleaning before training
-- Auto-tuned batch size based on available memory
-- Simple FP32 training (stable and predictable)
+OPTIMIZATIONS BASED ON RESEARCH:
+1. XLA_PYTHON_CLIENT_PREALLOCATE=false (on-demand allocation)
+2. Reduced memory preallocation  
+3. Optimized batch size for throughput
+4. Gradient checkpointing for memory efficiency
 """
+
+import os
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CRITICAL: Set memory flags BEFORE importing JAX
+# JAX preallocates 75% of GPU memory by default
+# ═══════════════════════════════════════════════════════════════════════════════
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'  # Allocate on demand
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.80'   # If preallocating, use 80%
 
 print("=" * 60)
 print("🧠 RecurseZero - Starting...")
@@ -18,10 +27,9 @@ import sys
 import time
 import subprocess
 import gc
-import os
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SMART VRAM MANAGEMENT
+# GPU MONITORING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_gpu_stats():
@@ -50,46 +58,6 @@ def format_gpu_str(stats):
     if stats['gpu_util'] < 0:
         return ""
     return f"GPU: {stats['gpu_util']}% | VRAM: {stats['mem_used']}/{stats['mem_total']}MB | {stats['temp']}°C"
-
-def clean_vram():
-    """Clean up GPU VRAM before training."""
-    print("🧹 Cleaning VRAM...", flush=True)
-    
-    # Force Python garbage collection
-    gc.collect()
-    
-    # Try to clear JAX caches
-    try:
-        import jax
-        jax.clear_caches()
-        print("  ✓ JAX caches cleared")
-    except Exception:
-        pass
-    
-    # Force garbage collection again
-    gc.collect()
-    
-    stats = get_gpu_stats()
-    if stats['mem_free'] > 0:
-        print(f"  ✓ Free VRAM: {stats['mem_free']}MB / {stats['mem_total']}MB")
-    
-    return stats
-
-def auto_batch_size(target_vram_usage=0.7):
-    """
-    Return optimal batch size for speed.
-    
-    Testing showed:
-    - batch 2048: 2.9 s/s (BEST)
-    - batch 3584: 0.9 s/s (slower)
-    - batch 4096: 1.4 s/s (slower)
-    
-    Larger batch = slower per-step, doesn't improve throughput.
-    """
-    # Fixed optimal batch size based on testing
-    OPTIMAL_BATCH = 2048
-    print(f"  ✓ Using optimal batch size: {OPTIMAL_BATCH}")
-    return OPTIMAL_BATCH
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # IMPORT DEPENDENCIES
@@ -142,11 +110,9 @@ def main():
     
     setup_jax_platform()
     
-    # Clean VRAM and auto-tune batch size
-    print()
-    clean_vram()
-    BATCH_SIZE = auto_batch_size(target_vram_usage=0.75)
-    print()
+    # Show initial VRAM
+    stats = get_gpu_stats()
+    print(f"Initial VRAM: {stats['mem_used']}/{stats['mem_total']}MB")
     
     # Apply Metal Patch for Pgx
     print("Applying Pgx patches...", flush=True)
@@ -154,6 +120,8 @@ def main():
     apply_patch()
     
     # 1. Initialize Environment
+    # Optimal batch size based on testing: 2048 gives best steps/sec
+    BATCH_SIZE = 2048
     print(f"Initializing environment (batch_size={BATCH_SIZE})...", flush=True)
     env = RecurseEnv(batch_size=BATCH_SIZE)
     key = jax.random.PRNGKey(42)
@@ -162,7 +130,12 @@ def main():
     env_state = env.init(env_key)
     print(f"✓ Environment: Batch={BATCH_SIZE}, Actions={env.num_actions}", flush=True)
     
-    # 2. Initialize Model (simple FP32 - stable and predictable)
+    # Check VRAM after env init
+    gc.collect()
+    stats = get_gpu_stats()
+    print(f"  After env init: {stats['mem_used']}MB used")
+    
+    # 2. Initialize Model
     print("Initializing model...", flush=True)
     agent = RecurseZeroAgentFast(num_actions=env.num_actions)
     dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
@@ -170,9 +143,12 @@ def main():
     key, init_key = jax.random.split(key)
     params = agent.init(init_key, dummy_obs)
     
-    # Count parameters
     param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"✓ Model initialized ({param_count:,} parameters)", flush=True)
+    
+    # Check VRAM after model init
+    stats = get_gpu_stats()
+    print(f"  After model init: {stats['mem_used']}MB used")
     
     # 3. Optimizer Setup
     print("Setting up optimizer...", flush=True)
@@ -186,11 +162,6 @@ def main():
         tx=optimizer
     )
     print("✓ Optimizer ready", flush=True)
-    
-    # Check VRAM after setup
-    gc.collect()
-    stats = get_gpu_stats()
-    print(f"✓ Setup complete | {format_gpu_str(stats)}")
     
     # 4. JIT Warmup
     print()
@@ -219,7 +190,7 @@ def main():
     
     print()
     print("=" * 60)
-    print(f"TRAINING ({NUM_STEPS:,} steps @ batch={BATCH_SIZE})")
+    print(f"TRAINING ({NUM_STEPS:,} steps)")
     print("=" * 60)
     print()
     
@@ -268,7 +239,6 @@ def main():
                     gpu_stats = get_gpu_stats()
                     loss_val = float(metrics['total_loss'])
                     win_prob = float(metrics.get('win_probability', 0.5))
-                    confidence = float(metrics.get('confidence', 0.5))
                     
                     progress.console.print(
                         f"  Step {i:5d} │ "
@@ -316,10 +286,8 @@ def main():
     print(f"  Steps: {NUM_STEPS:,} | Time: {total_time:.0f}s | Speed: {avg_speed:.1f} s/s")
     print(f"  Positions/sec: {positions_per_sec:,.0f}")
     print(f"  Games played: {total_games:,}")
-    print(f"  W/L/D: {total_wins}/{total_losses}/{total_draws}")
     if total_games > 0:
         print(f"  Win rate: {100*total_wins/total_games:.1f}%")
-        print(f"  Draw rate: {100*total_draws/total_games:.1f}%")
     print()
 
 if __name__ == "__main__":
