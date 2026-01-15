@@ -72,15 +72,15 @@ class RecurseZeroAgentFast(nn.Module):
     """
     Speed-optimized agent for L4 GPU.
     
-    Reduced parameters for faster training.
-    Target: 2-4 steps/second on L4.
+    Aggressively reduced parameters for fast training.
+    Target: 3+ steps/second on L4.
     """
     hidden_dim: int = 128
     heads: int = 4
     mlp_dim: int = 512
     num_actions: int = 4672
-    deq_iters: int = 4
-    deq_tol: float = 1e-2
+    deq_iters: int = 3       # Reduced from 4
+    deq_tol: float = 5e-2    # Looser tolerance
     deq_beta: float = 0.9
     deq_m: int = 2
     

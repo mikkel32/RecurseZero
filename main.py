@@ -77,43 +77,19 @@ def clean_vram():
 
 def auto_batch_size(target_vram_usage=0.7):
     """
-    Automatically determine batch size based on available VRAM.
+    Return optimal batch size for speed.
     
-    Args:
-        target_vram_usage: Target VRAM usage ratio (0.7 = 70%)
-        
-    Returns:
-        Recommended batch size
+    Testing showed:
+    - batch 2048: 2.9 s/s (BEST)
+    - batch 3584: 0.9 s/s (slower)
+    - batch 4096: 1.4 s/s (slower)
+    
+    Larger batch = slower per-step, doesn't improve throughput.
     """
-    stats = get_gpu_stats()
-    
-    if stats['mem_total'] < 0:
-        print("  ⚠ Cannot detect VRAM, using default batch size")
-        return 2048
-    
-    total_mb = stats['mem_total']
-    
-    # Estimate: ~4MB per game in batch for our model size
-    # This is a rough estimate based on observations
-    mb_per_game = 4
-    
-    # Target VRAM = total * target_ratio
-    target_mb = total_mb * target_vram_usage
-    
-    # Reserve some VRAM for model weights (~2GB) and overhead (~2GB)
-    available_mb = target_mb - 4000
-    
-    if available_mb < 1000:
-        batch = 512
-    else:
-        batch = int(available_mb / mb_per_game)
-    
-    # Round to power of 2 for efficiency
-    batch = 2 ** int(batch).bit_length() - 1
-    batch = max(512, min(8192, (batch // 512) * 512))  # Round to 512
-    
-    print(f"  ✓ Auto batch size: {batch} (based on {total_mb}MB VRAM)")
-    return batch
+    # Fixed optimal batch size based on testing
+    OPTIMAL_BATCH = 2048
+    print(f"  ✓ Using optimal batch size: {OPTIMAL_BATCH}")
+    return OPTIMAL_BATCH
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # IMPORT DEPENDENCIES
