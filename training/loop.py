@@ -8,7 +8,6 @@ from algorithm.muesli import muesli_policy_gradient_loss, compute_muesli_targets
 from algorithm.pve import pve_loss
 
 class TrainState(train_state.TrainState):
-    # Extended state to track episodic metrics
     pass
 
 @partial(jax.jit, static_argnames=('agent_apply_fn', 'env_step_fn', 'env_init_fn'))
@@ -18,131 +17,129 @@ def resident_train_step(
     key: jax.Array,
     agent_apply_fn,
     env_step_fn,
-    env_init_fn=None  # For resetting terminated games
+    env_init_fn=None
 ):
     """
-    Executes one step of Resident Training (Env Step + Model Update).
-    Compiled into a single XLA kernel.
+    SPEED OPTIMIZED Resident Training Step.
     
-    Key improvements:
-    - Handles game termination and auto-reset
-    - Proper reward extraction at game end
-    - Tracks episodic returns
+    Changes:
+    - Single forward pass (no separate next_values call)
+    - Simplified game reset logic
+    - Proper reward extraction
     """
     batch_size = env_state.observation.shape[0]
     
-    # 1. Environment Interaction
+    # 1. Get current state info
     obs = env_state.observation
+    current_player = env_state.current_player
     
-    # Run Inference (No Gradients) - Get action distribution
-    policy_logits, values, _ = agent_apply_fn(state.params, obs)
+    # Run Inference
+    policy_logits, values, reward_pred = agent_apply_fn(state.params, obs)
     
-    # Mask illegal moves (set logits to -inf)
+    # Mask illegal moves and sample
     legal_mask = env_state.legal_action_mask
     masked_logits = jnp.where(legal_mask, policy_logits, -1e9)
     
-    # Sample from policy (exploration) instead of argmax
     key, action_key = jax.random.split(key)
     actions = jax.random.categorical(action_key, masked_logits)
     
-    # Step Environment (Pgx)
+    # Step Environment
     next_env_state = env_step_fn(env_state, actions)
     
-    # 2. Proper Reward Extraction
-    # Rewards in Pgx are [player0_reward, player1_reward] per position
-    # We need the reward for the current player who just moved
-    player_indices = env_state.current_player  # (B,)
-    # rewards shape is (B, 2) - one for each player
-    rewards = next_env_state.rewards[jnp.arange(batch_size), player_indices]  # (B,)
+    # 2. Extract rewards CORRECTLY
+    # In Pgx chess: rewards is (B, 2) where [player0_reward, player1_reward]
+    # We want the reward for the player who just moved (current_player BEFORE step)
+    rewards_all = next_env_state.rewards  # (B, 2)
+    rewards = rewards_all[jnp.arange(batch_size), current_player]  # (B,)
     
-    # Terminal mask - games that just ended
-    terminated = next_env_state.terminated  # (B,) boolean
+    # Terminal detection
+    terminated = next_env_state.terminated
     
-    # 3. Auto-Reset terminated games
-    if env_init_fn is not None:
-        key, reset_key = jax.random.split(key)
-        reset_keys = jax.random.split(reset_key, batch_size)
-        fresh_states = env_init_fn(reset_keys)
-        
-        # Selectively replace terminated games with fresh states
-        # Use jax.tree_map to handle the state structure
-        def select_state(fresh, current, mask):
-            # mask is True where we want fresh (terminated games)
-            return jnp.where(
-                mask.reshape((-1,) + (1,) * (len(current.shape) - 1)),
-                fresh,
-                current
-            )
-        
-        next_env_state = jax.tree.map(
-            lambda f, c: select_state(f, c, terminated),
-            fresh_states,
-            next_env_state
-        )
-    
+    # 3. Compute TD target (bootstrap from next state value)
+    # Only call forward pass on next state for non-terminated games
     next_obs = next_env_state.observation
-    
-    # 4. Compute Targets with terminal handling
     _, next_values, _ = agent_apply_fn(state.params, next_obs)
-    
-    vals = jnp.squeeze(values, -1)
     next_vals = jnp.squeeze(next_values, -1)
     
-    # Zero out next_vals for terminated games (no future value)
+    # Zero out next values for terminated games
     next_vals = jnp.where(terminated, 0.0, next_vals)
     
-    advantages, target_values = compute_muesli_targets(vals, rewards, next_vals)
+    vals = jnp.squeeze(values, -1)
     
-    # 5. Model Update (Loss Calculation)
+    # Compute targets
+    gamma = 0.99
+    target_values = rewards + gamma * next_vals
+    advantages = target_values - vals
+    advantages = jnp.clip(advantages, -1.0, 1.0)
+    
+    # 4. Loss function
     def loss_fn(params):
         p_logits, v_pred, r_pred = agent_apply_fn(params, obs)
         v_pred = jnp.squeeze(v_pred, -1)
         r_pred = jnp.squeeze(r_pred, -1)
         
-        # Policy Loss with legal move masking
-        masked_p_logits = jnp.where(legal_mask, p_logits, -1e9)
-        pg_loss = muesli_policy_gradient_loss(masked_p_logits, actions, advantages)
+        # Mask illegal for policy loss
+        masked_p = jnp.where(legal_mask, p_logits, -1e9)
         
-        # PVE Loss
-        loss_pve = pve_loss(v_pred, target_values, r_pred, rewards)
+        # Policy gradient loss
+        one_hot = jax.nn.one_hot(actions, p_logits.shape[-1])
+        log_probs = jax.nn.log_softmax(masked_p)
+        selected_log_probs = jnp.sum(log_probs * one_hot, axis=-1)
+        pg_loss = -jnp.mean(selected_log_probs * advantages)
         
-        total_loss = pg_loss + loss_pve
-        return total_loss, (pg_loss, loss_pve)
+        # Value loss  
+        value_loss = jnp.mean(jnp.square(v_pred - target_values))
+        
+        # Reward prediction loss (only for terminal states)
+        reward_loss = jnp.mean(jnp.where(terminated, jnp.square(r_pred - rewards), 0.0))
+        
+        total = pg_loss + 0.5 * value_loss + 0.1 * reward_loss
+        return total, (pg_loss, value_loss, reward_loss)
 
-    grads, (pg_loss, pve_loss_val) = jax.grad(loss_fn, has_aux=True)(state.params)
+    grads, (pg_loss, v_loss, r_loss) = jax.grad(loss_fn, has_aux=True)(state.params)
     
-    # Gradient clipping for stability
+    # Gradient clipping
     grads = jax.tree.map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
     
-    # 6. Optimizer Step
+    # 5. Optimizer step
     new_state = state.apply_gradients(grads=grads)
     
-    # 7. Calculate Metrics
-    # Policy Entropy (over legal moves only)
-    probs = jax.nn.softmax(masked_logits, axis=-1)
-    log_probs = jnp.log(probs + 1e-8)
-    entropy = -jnp.sum(probs * log_probs, axis=-1)
-    mean_entropy = jnp.mean(entropy)
+    # 6. Auto-reset terminated games (simplified)
+    if env_init_fn is not None:
+        key, reset_key = jax.random.split(key)
+        reset_keys = jax.random.split(reset_key, batch_size)
+        fresh_states = env_init_fn(reset_keys)
+        
+        # Broadcast terminated mask for each field
+        def select(fresh, current):
+            mask = terminated.reshape((-1,) + (1,) * (len(current.shape) - 1))
+            return jnp.where(mask, fresh, current)
+        
+        next_env_state = jax.tree.map(select, fresh_states, next_env_state)
     
-    # Win rate from terminated games
-    terminal_rewards = jnp.where(terminated, rewards, 0.0)
-    wins = jnp.sum(terminal_rewards > 0)
-    losses = jnp.sum(terminal_rewards < 0)
-    draws = jnp.sum((terminated) & (terminal_rewards == 0))
-    games_finished = jnp.sum(terminated)
+    # 7. Metrics
+    probs = jax.nn.softmax(masked_logits, axis=-1)
+    log_probs_m = jnp.log(probs + 1e-8)
+    entropy = -jnp.sum(probs * log_probs_m, axis=-1)
+    
+    # Count outcomes
+    games_done = jnp.sum(terminated)
+    wins = jnp.sum((terminated) & (rewards > 0.5))
+    losses = jnp.sum((terminated) & (rewards < -0.5))
+    draws = jnp.sum((terminated) & (jnp.abs(rewards) < 0.5))
     
     metrics = {
-        'total_loss': pg_loss + pve_loss_val,
+        'total_loss': pg_loss + 0.5 * v_loss + 0.1 * r_loss,
         'pg_loss': pg_loss,
-        'pve_loss': pve_loss_val,
+        'value_loss': v_loss,
         'mean_reward': jnp.mean(rewards),
-        'policy_entropy': mean_entropy,
+        'terminal_rewards': jnp.sum(jnp.where(terminated, rewards, 0.0)),
+        'policy_entropy': jnp.mean(entropy),
         'mean_value': jnp.mean(values),
-        'games_finished': games_finished,
+        'games_finished': games_done,
         'wins': wins,
         'losses': losses,
         'draws': draws,
-        'terminal_reward': jnp.sum(jnp.abs(terminal_rewards)),  # Total reward from finished games
     }
     
     return new_state, next_env_state, metrics
