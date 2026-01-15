@@ -1,0 +1,298 @@
+﻿Project RecurseZero: A GPU-Resident, Recursive Deep Equilibrium Architecture for Efficient Superhuman Chess AI
+1. Introduction: The Hardware Bottleneck and the Resident Paradigm
+The quest for superhuman performance in computer chess has evolved through distinct epochs, each defined by the dominant hardware constraint of its time. The brute-force era of Deep Blue maximized CPU evaluations per second; the neural era of AlphaZero maximized the utilization of Tensor Processing Units (TPUs) for massive search trees. However, as we descend from the hyperscale infrastructure of research laboratories to the constrained environments of consumer hardware—specifically the NVIDIA RTX 2070 (8GB VRAM) and the unified memory architecture of Apple Silicon (MPS)—a new bottleneck emerges. This is not a limitation of compute capability, but of data latency. This report delineates the architecture for "RecurseZero," a novel chess agent designed to achieve superhuman performance within these constraints by eliminating the CPU from the critical path entirely, leveraging recursive Deep Equilibrium Models (DEQ) for infinite effective depth, and utilizing the Muesli algorithm for search-free inference.
+1.1 The CPU-GPU Transfer Latency Problem
+Traditional Deep Reinforcement Learning (RL) pipelines for board games operate on a bifurcated architecture that fundamentally violates the principles of high-performance computing on limited bandwidth systems. In standard implementations like AlphaZero or MuZero, the game logic—including move generation, state transitions, and legality checking—is executed on the Central Processing Unit (CPU). Conversely, the policy and value evaluations, which drive the search heuristics, are offloaded to the Graphics Processing Unit (GPU). This separation necessitates a continuous, bidirectional flow of data across the PCIe bus.1
+The computational cost of this architecture is severe. For every node expanded in a Monte Carlo Tree Search (MCTS), the system must:
+1. Serialize the board state on the CPU.
+2. Transfer the tensor to GPU memory (H2D latency).
+3. Execute the neural network inference.
+4. Transfer the resulting policy and value logits back to the CPU (D2H latency).
+5. Update the search tree pointers and statistics.
+On a workstation with an RTX 2070, the PCIe bandwidth and the latency of kernel launching become the limiting factors. While the GPU is theoretically capable of evaluating tens of thousands of positions per second, the "CPU bottleneck" acts as a governor, throttling throughput to a fraction of the hardware's potential. Amdahl's Law dictates that the speedup of the system is strictly limited by this sequential, non-accelerated component.4 For an 8GB VRAM constraint, this inefficiency is doubly punitive; the memory is occupied by model weights that sit idle while waiting for the CPU to feed them data.
+1.2 The Solution: JAX-Native Resident Environments
+To break this bottleneck, RecurseZero adopts a "GPU-Resident" paradigm. By utilizing Pgx, a suite of JAX-native board game environments, the entire lifecycle of the agent—environment stepping, move generation, legality masking, and termination checks—is compiled into XLA (Accelerated Linear Algebra) kernels that reside on the accelerator.1
+This architectural shift has profound implications:
+* Elimination of PCIe Transfer: The experience replay buffer, the current environment state, and the neural network weights all coexist in the GPU VRAM (or Unified Memory on MPS). Training and inference steps become purely device-local operations, invoking high-speed memory bandwidth (448 GB/s on RTX 2070) rather than the slow PCIe bus.
+* Auto-Vectorization: Leveraging JAX’s vmap primitive, the agent can step thousands of chess games simultaneously in a single kernel call. This saturation of the CUDA cores (or Apple Neural Engine) allows for sample generation rates that are 10-100x faster than optimized C++ implementations running on the host CPU.5
+* End-to-End Differentiability: While not strictly required for Muesli, the resident nature allows for advanced meta-learning or hyperparameter tuning techniques that require backpropagation through the environment dynamics, offering a pathway to even greater sample efficiency.7
+1.3 The Efficiency Imperative: 8GB VRAM
+The strict 8GB VRAM limit of the RTX 2070 and the shared memory pool of Apple Silicon devices necessitates a radical departure from the "wider and deeper" scaling laws of Large Language Models. We cannot simply load a multi-billion parameter model. Instead, we must optimize for Parameter Efficiency and State Abstraction.
+RecurseZero achieves this through two primary mechanisms:
+1. Recursive Deep Learning: Using Universal Transformers and Deep Equilibrium Models to decouple model depth from parameter count. A single layer's weights are recycled infinitely to achieve the required reasoning depth.8
+2. Proper Value Equivalence (PVE): Training the model to learn only the abstract state representations necessary for planning (value prediction), effectively compressing the state space by ignoring irrelevant visual or historical noise.10
+The following sections detail the implementation of this architecture, moving from the theoretical underpinnings of recursive reasoning to the practicalities of quantization and deployment on specific hardware targets.
+________________
+2. Architectural Core: Recursive Deep Learning and Node-Skipping
+The core requirement of the user query is the integration of "recursive/node-skipping SOTA tech." In the context of efficient deep learning, this points away from fixed-depth Convolutional Neural Networks (CNNs) used in AlphaZero and towards Deep Equilibrium Models (DEQ) based on Universal Transformers (UT). This architecture allows the agent to dynamically allocate compute resources based on the complexity of the board position—effectively "skipping" computational nodes for simple states while "recursing" deeply for complex tactical lines.
+2.1 Universal Transformers: Recurrence in Depth
+The standard Transformer architecture, while powerful, is parameter-inefficient. A 12-layer GPT model stores 12 distinct sets of weights. The Universal Transformer (UT), conversely, defines a single Transformer block $f_\theta$ and applies it recurrently to the evolving hidden state $h_t$.9
+
+
+$$h_{t+1} = f_\theta(h_t, \text{PositionalEmbeddings})$$
+This "Recurrence in Depth" aligns naturally with the cognitive process of chess analysis. When a human master analyzes a position, they do not apply twelve different "brains" in sequence; they apply the same reasoning faculties iteratively to refine their understanding of the board.
+* VRAM Efficiency: By sharing weights across all $T$ steps of recurrence, the UT architecture reduces the parameter memory footprint by a factor of $T$. For an 8GB GPU, this allows us to maximize the width (embedding dimension $d_{model}$) of the single block, which correlates strongly with capacity, without running out of memory due to depth.12
+* Inductive Bias: The recursive structure provides a strong inductive bias for algorithmic generalization. Chess logic (e.g., sliding piece connectivity, pawn chains) often requires iterative propagation of constraints across the board, which UTs handle superiorly compared to feed-forward networks.14
+2.2 Deep Equilibrium Models (DEQ): Infinite Depth with O(1) Memory
+RecurseZero pushes the UT concept to its limit using Deep Equilibrium Models (DEQ). Instead of iterating for a fixed number of steps $T$, the DEQ formulation posits that the optimal representation of a board state is the fixed point $z^*$ of the transformation layer $f_\theta$.8
+
+
+$$z^* = f_\theta(z^*; x)$$
+where $x$ is the injection of the static board features (piece positions).
+2.2.1 Node-Skipping as Adaptive Computation
+The "node-skipping" technology requested is realized here through the mechanics of the fixed-point solver. To find $z^*$, the agent employs a root-finding algorithm (such as Anderson Acceleration or Broyden's Method) during the forward pass.
+* Adaptive Depth: The solver iterates until the residual $||f(z_k) - z_k||$ falls below a tolerance threshold $\epsilon$.
+* Mechanism: For "easy" positions (e.g., obvious recaptures or forced mates), the representation converges to the fixed point rapidly (few iterations). For "hard" positions (e.g., complex middlegame tension), the solver takes more steps to stabilize.
+* Efficiency: This is an implicit "node-skipping" or "early exit" mechanism. The hardware does not waste cycles processing simple states through a fixed 50-layer depth; it exits as soon as the representation is stable. This dynamic compute allocation is crucial for maintaining real-time performance on the RTX 2070.15
+2.2.2 Implicit Differentiation for Memory Constraint
+The most critical advantage of DEQs for the 8GB VRAM constraint is Implicit Differentiation. Training a standard recursive model via Backpropagation Through Time (BPTT) requires storing the intermediate activations for every step $t=1 \dots T$. This scales memory usage linearly with depth $O(T)$, quickly exhausting 8GB.
+DEQs avoid this entirely. By applying the Implicit Function Theorem, the gradient of the fixed point $z^*$ with respect to the parameters $\theta$ can be computed directly from the final state, without accessing the intermediate history 18:
+
+
+$$\frac{\partial \ell}{\partial \theta} = - \frac{\partial \ell}{\partial z^*} (I - J_{f_\theta}(z^*))^{-1} \frac{\partial f_\theta(z^*, x)}{\partial \theta}$$
+where $J_{f_\theta}$ is the Jacobian of the transformation.
+* Constant Memory Cost: The memory required for training is $O(1)$—it depends only on the size of the single block's weights and the final state $z^*$. This allows RecurseZero to simulate an "infinite depth" network while consuming the VRAM of a single-layer model.20
+2.3 Stabilization: Gated Transformer-XL (GTrXL)
+Recursive application of non-linear layers is notoriously unstable, often leading to vanishing or exploding gradients that prevent convergence. To stabilize the RecurseZero architecture, we integrate the gating mechanism from Gated Transformer-XL (GTrXL).22
+The GTrXL block replaces the standard residual connection ($h + f(h)$) with a Gated Recurrent Unit (GRU)-style update:
+
+
+$$\begin{aligned} r_t &= \sigma(W_r h_{t-1} + U_r f(h_{t-1})) \\ z_t &= \sigma(W_z h_{t-1} + U_z f(h_{t-1})) \\ \tilde{h}_t &= \tanh(W_h (r_t \odot h_{t-1}) + U_h f(h_{t-1})) \\ h_t &= (1 - z_t) \odot h_{t-1} + z_t \odot \tilde{h}_t \end{aligned}$$
+* Role in RL: This gating allows the model to selectively retain information from previous iterations or overwrite it with new computations. In the context of Deep RL, where the data distribution is non-stationary and high-variance, GTrXL has been proven to significantly improve stability and performance compared to standard LSTMs or vanilla Transformers.24 It acts as a dampener for the recursive dynamics, ensuring that the fixed-point iteration remains well-behaved.
+2.4 Positional Encodings for Chess Geometry
+Standard Transformers use 1D sinusoidal positional encodings, which are ill-suited for the 2D grid topology and knight-move connectivity of chess. RecurseZero employs Relative Positional Encodings or Rotary Embeddings (RoPE) tailored for the board.26
+* The "Chessformer" Insight: Research into "Chessformer" architectures 28 indicates that the model's ability to reason about the board is strictly limited by how spatial relationships are encoded.
+* Implementation: We define learnable relative bias terms that encode the relation between the query square $i$ and key square $j$ (e.g., "same rank," "knight jump away," "diagonal"). This allows the attention heads to naturally learn concepts like "sliding piece scope" and "pawn structure" without needing to relearn the board geometry from scratch.28
+________________
+3. The Algorithm: Muesli Policy Optimization
+While MuZero is the current state-of-the-art for board games, it relies on Monte Carlo Tree Search (MCTS) at inference time to refine its policy. MCTS is computationally expensive and introduces the exact CPU/control-flow overhead we seek to eliminate. The Muesli algorithm represents the next evolution: a policy optimization method that matches MuZero's sample efficiency but eliminates the need for search at inference.29
+3.1 Muesli Mechanics: Search-Free Inference
+Muesli trains a policy network $\pi_\theta(a|s)$ to directly approximate the optimal move distribution. Unlike MuZero, which treats the policy as a prior for search, Muesli treats the policy as the actor.
+* Inference Speed: At test time (gameplay), RecurseZero simply runs a forward pass of the DEQ-Transformer to obtain the policy logits. There is no MCTS loop, no rollout, and no back-and-forth between host and device. This allows the agent to evaluate thousands of positions per second on the GPU, a metric often correlated with playing strength in "instinctive" or blitz scenarios.30
+* Auxiliary Model Learning: Muesli still learns a dynamics model (predicting rewards and values), but it uses this model as a regularizer and a source of better training targets, not as a runtime dependency. The model is used to construct a "Retrace" target that corrects the value estimation of off-policy data stored in the replay buffer.29
+3.2 The Muesli Loss Function
+The Muesli update rule is designed to be robust to the off-policy data generated by the massive parallelism of the Pgx environment. It combines a policy gradient loss with a regularized advantage estimate.
+The core policy update minimizes the KL divergence between the current policy and a "target" policy derived from the learned model's value estimates:
+
+
+$$\mathcal{L}_{policy} = - \mathbb{E} \left$$
+* Clipped MPO (CMPO): The term $\text{clip}(\hat{A})$ represents the Clipped Maximum A Posteriori Policy Optimization objective. It ensures that the policy updates are conservative, preventing the catastrophic forgetting often seen in standard Policy Gradient methods.29
+* Advantage Calculation: The advantage $\hat{A}$ is computed using the learned model's value function $V_\phi(s)$ and the stored rewards, effectively distilling the lookahead capability of the model into the instantaneous policy network.31
+3.3 Proper Value Equivalence (PVE)
+To further maximize the efficiency of the 8GB VRAM, RecurseZero employs Proper Value Equivalence (PVE) as its model learning objective.10
+* The Principle: A model does not need to perfectly reconstruct the visual state of the board (e.g., pixel-perfect prediction). It only needs to be "value equivalent"—that is, it must predict the same value $V(s)$ and reward $R$ as the true environment for all policies.
+* State Abstraction: By minimizing the PVE loss, the DEQ-Transformer learns a compressed, abstract state representation that discards irrelevant information (e.g., graphical style, exact move history beyond the Markov horizon) and focuses purely on strategic dynamics. This abstraction allows for smaller embedding dimensions $d_{model}$, fitting larger batch sizes into the limited VRAM.33
+________________
+4. Hardware Constraints and Optimization (RTX 2070 & MPS)
+Developing for the RTX 2070 (8GB VRAM) and Apple Silicon (MPS) requires aggressive optimization to fit the "superhuman" capability into consumer hardware.
+4.1 JAX Accurate Quantization Training (AQT)
+To overcome the 8GB VRAM barrier, RecurseZero utilizes Accurate Quantization Training (AQT).34 Standard FP32 weights are a luxury this architecture cannot afford.
+* Int8 Implementation: Using JAX's AQT library, we inject quantization operations into the computation graph. The Universal Transformer's Dense layers (Linear projections) use Int8 weights and Int8 inputs for the matrix multiplications (GEMM).
+* Tensor Core Usage: The RTX 2070 features Turing Tensor Cores designed specifically for accelerating Int8 GEMM operations. AQT ensures these cores are utilized, providing a theoretical 4x throughput increase over FP32 and a 4x reduction in memory footprint.36
+* Training Awareness: Unlike post-training quantization, AQT simulates the quantization noise during the forward pass of training. The network learns to be robust to the reduced precision, minimizing the accuracy drop typically associated with Int8 inference.34
+4.2 Distillation: The Teacher-Student Framework
+To enable "node-skipping" efficiency at the highest level, we employ a distillation protocol.
+* Teacher: A larger DEQ-Transformer (e.g., wider width, stricter tolerance $\epsilon$) trained offline, potentially on a cluster or over a longer duration.
+* Student: The deployed RecurseZero agent (optimized for 8GB VRAM).
+* Protocol: The Student is trained to minimize the KL Divergence between its policy output and the Teacher's policy output.
+$$ \mathcal{L}{distill} = D{KL}(\pi_{teacher}(\cdot|s) |
+| \pi_{student}(\cdot|s)) $$
+This allows the Student to learn from the "dark knowledge" of the Teacher—information about the relative merit of suboptimal moves—which is richer than the binary win/loss signal of raw self-play.38
+4.3 Apple Silicon (MPS) Specifics: The Metal Limitation
+Deploying on Apple Silicon via jax-metal presents unique challenges identified in the research data.40
+   * The 32-Bit Constraint: Current implementations of JAX on Metal (MPS) do not support 64-bit floating point (FP64) operations efficiently, and random number generation (RNG) can be significantly slower than on CUDA.41
+   * Adaptation: RecurseZero adapts to this by enforcing strict FP32 (or mixed precision BF16) arithmetic throughout the pipeline. The PVE loss and Muesli advantage calculations are numerically stabilized to prevent overflow/underflow without 64-bit precision.
+   * Unified Memory Management: While MPS avoids PCIe transfers, the Unified Memory architecture is sensitive to allocation churn. The Pgx environment must be compiled with jax.jit and jax.lax.scan to ensure static memory allocation, preventing the overhead of dynamic buffer creation that can stall the M-series GPU.41
+________________
+5. Real-Time Interpretability and Accuracy Tracking
+A key requirement is "real-time accuracy tracking." The "black box" nature of neural networks is mitigated here by the interpretability inherent in Transformers.
+5.1 Chessformer Attention Maps
+By extracting the attention weights from the Universal Transformer block, RecurseZero provides real-time visual insight into its reasoning, a feature termed Chessformer Visualization.27
+   * Mechanism: Using flax.linen.Module.sow, we capture the $8 \times 8 \rightarrow 8 \times 8$ attention matrix for each head during the forward pass.43
+   * Visualization: These weights are overlaid on the board. A "Bishop" attention head will light up the diagonals from the bishop's square; a "King Safety" head will light up the squares around the king.
+   * Interpretation: This allows the user to verify if the agent is "seeing" a threat (attending to an attacker) or missing it, providing a granular level of accuracy tracking beyond simple win/loss metrics.27
+5.2 Confidence and Win-Rate Estimation
+The Muesli Value Head outputs a scalar $v \in [-1, 1]$, which maps directly to the win probability $P(win) = \frac{v+1}{2}$.
+   * Entropy Metric: We track the entropy of the policy distribution $H(\pi) = - \sum \pi(a) \log \pi(a)$. High entropy indicates uncertainty/complexity; low entropy indicates calculation confidence.
+   * Fixed-Point Residual: The convergence speed of the DEQ solver (number of iterations to reach $z^*$) serves as a proxy for "positional complexity." Tracking this metric in real-time reveals which positions the agent finds "difficult".17
+________________
+6. Implementation Strategy
+6.1 Code Structure (JAX/Flax)
+The implementation leverages the composability of JAX, Flax (neural networks), and Optax (optimization).
+Table 1: Core Technology Stack
+Component
+	Library
+	Purpose
+	Environment
+	pgx
+	GPU-resident chess logic, auto-vectorization.
+	Model
+	flax.linen
+	Neural network definition, variable management.
+	Optimization
+	optax
+	Gradient transformation, clipping, AdamW optimizer.
+	Quantization
+	aqt (JAX)
+	Int8 injection for Tensor Core utilization.
+	Backend
+	jax-metal / cuda
+	Hardware abstraction for MPS / RTX.
+	6.2 The Recursive Block (Code Concept)
+
+
+Python
+
+
+
+
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+
+class RecursiveBlock(nn.Module):
+   hidden_dim: int
+   heads: int
+
+   @nn.compact
+   def __call__(self, x, gating_state):
+       # 1. Multi-Head Self Attention
+       norm_x = nn.LayerNorm()(x)
+       attn = nn.MultiHeadDotProductAttention(
+           num_heads=self.heads, 
+           qkv_features=self.hidden_dim
+       )(norm_x)
+       
+       # 2. GTrXL Gating (Stabilization)
+       # Replaces x = x + attn
+       x = self.GatedUpdate(x, attn, gating_state)
+       
+       # 3. MLP
+       mlp = nn.Dense(self.hidden_dim * 4)(x)
+       mlp = nn.gelu(mlp)
+       mlp = nn.Dense(self.hidden_dim)(mlp)
+       
+       # 4. GTrXL Gating
+       x = self.GatedUpdate(x, mlp, gating_state)
+       
+       return x
+
+6.3 The Resident Training Loop
+The training loop avoids Python control flow entirely within the step, compiling the entire update into a single XLA graph.
+
+
+Python
+
+
+
+
+@jax.jit
+def train_step(params, opt_state, env_state, key):
+   # 1. Step Environment (Pgx) - Thousands of games in parallel
+   keys = jax.random.split(key, num_envs)
+   act_keys, step_keys = keys[:, 0], keys[:, 1]
+   
+   # Policy Inference (No Search)
+   logits, _ = model.apply(params, env_state.observation)
+   actions = jax.random.categorical(act_keys, logits)
+   
+   # Execute Move in VRAM
+   next_state = pgx_env.step(env_state, actions)
+   
+   # 2. Compute Muesli Loss (Policy + PVE)
+   def loss_fn(p):
+       #... (DEQ Forward Pass & Loss Calculation)...
+       return total_loss
+
+   # 3. Update Weights
+   grads = jax.grad(loss_fn)(params)
+   updates, new_opt_state = optimizer.update(grads, opt_state)
+   new_params = optax.apply_updates(params, updates)
+   
+   return new_params, new_opt_state, next_state
+
+________________
+7. Comparative Performance Analysis
+Table 2: Architecture Comparison
+
+
+Feature
+	AlphaZero / MuZero
+	RecurseZero (Proposed)
+	Benefit
+	Environment
+	CPU (C++)
+	GPU Resident (Pgx)
+	Eliminates PCIe bottleneck; 100x throughput.1
+	Depth
+	Fixed (ResNet-40)
+	Infinite (DEQ)
+	O(1) Memory; Adaptive compute time.18
+	Inference
+	MCTS (Search)
+	Direct Policy (Muesli)
+	Real-time "instinctive" play; no search latency.29
+	Memory
+	FP32 / Linear Growth
+	Int8 / Constant
+	Fits massive logical depth in 8GB VRAM.36
+	State
+	Visual / Full
+	PVE Abstract
+	Learns only winning dynamics; ignores noise.10
+	Insight: The synergy between Pgx and DEQ is the defining characteristic of RecurseZero. Pgx removes the latency floor, enabling the GPU to run at maximum clock speed. DEQ removes the memory ceiling, allowing a "deep" model to fit in limited VRAM. Muesli provides the sample efficiency to train this system to superhuman levels without the crutch of expensive runtime search.
+________________
+8. Conclusion
+The RecurseZero architecture represents a definitive solution to the problem of high-performance chess AI on constrained consumer hardware. By strictly enforcing a GPU-resident paradigm with Pgx, we eliminate the CPU bottleneck that has historically plagued RL research. By adopting Recursive Deep Equilibrium Models, we achieve the reasoning depth of massive supercomputer models within the memory envelope of an RTX 2070. And by utilizing Muesli and Proper Value Equivalence, we ensure that every byte of VRAM and every cycle of compute is dedicated to the strategic mastery of the game.
+This is not merely an incremental improvement; it is a structural reimagining of the chess engine. It moves away from the "Search" paradigm of the past 30 years and towards a "Reasoning" paradigm, where the neural network's internal recursion replaces the external tree search, delivering superhuman play that is fast, efficient, and interpretably transparent.
+Key References & Technologies
+   * Environment: Pgx (JAX) 1
+   * Architecture: Universal Transformer 9, Deep Equilibrium Models 8, Gated Transformer-XL.22
+   * Algorithm: Muesli 29, Proper Value Equivalence.10
+   * Optimization: JAX AQT (Quantization) 34, Distillation.38
+   * Hardware: JAX-Metal (Apple) 40, Tensor Cores (NVIDIA).36
+Citerede værker
+   1. Pgx: Hardware-Accelerated Parallel Game Simulators for Reinforcement Learning - OpenReview, tilgået januar 12, 2026, https://openreview.net/pdf?id=UvX8QfhfUx
+   2. AlphaZero implementation and tutorial | by Darin Straus | TDS Archive - Medium, tilgået januar 12, 2026, https://medium.com/data-science/alphazero-implementation-and-tutorial-f4324d65fdfc
+   3. JaxMARL: Multi-Agent RL Environments and Algorithms in JAX - arXiv, tilgået januar 12, 2026, https://arxiv.org/html/2311.10090v4
+   4. Batch wise Inference to speed up Muzero's MCTS - Artificial Intelligence Stack Exchange, tilgået januar 12, 2026, https://ai.stackexchange.com/questions/43699/batch-wise-inference-to-speed-up-muzeros-mcts
+   5. [2303.17503] Pgx: Hardware-Accelerated Parallel Game Simulators for Reinforcement Learning - arXiv, tilgået januar 12, 2026, https://arxiv.org/abs/2303.17503
+   6. Pgx: Hardware-Accelerated Parallel Game Simulators for Reinforcement Learning - Liner, tilgået januar 12, 2026, https://liner.com/review/pgx-hardwareaccelerated-parallel-game-simulators-for-reinforcement-learning
+   7. Meta-Gradient Reinforcement Learning with an Objective Discovered Online - NeurIPS, tilgået januar 12, 2026, https://proceedings.neurips.cc/paper/2020/file/ae3d525daf92cee0003a7f2d92c34ea3-Paper.pdf
+   8. Chapter 4: Deep Equilibrium Models, tilgået januar 12, 2026, http://implicit-layers-tutorial.org/deep_equilibrium_models/
+   9. MoEUT: Mixture-of-Experts Universal Transformers - OpenReview, tilgået januar 12, 2026, https://openreview.net/pdf?id=ZxVrkm7Bjl
+   10. Proper Value Equivalence - OpenReview, tilgået januar 12, 2026, https://openreview.net/pdf?id=aXbuWbta0V8
+   11. Distributional Model Equivalence for Risk-Sensitive Reinforcement Learning - NeurIPS, tilgået januar 12, 2026, https://proceedings.neurips.cc/paper_files/paper/2023/file/b0cd0e8027309ea050951e758b70d60e-Paper-Conference.pdf
+   12. Sparse Universal Transformer - ACL Anthology, tilgået januar 12, 2026, https://aclanthology.org/2023.emnlp-main.12.pdf
+   13. Spectroscopy Pre-trained Transformer (SpecPT): A Universal Spectroscopic Analysis and Redshift Measurement Framework - RIT Digital Institutional Repository, tilgået januar 12, 2026, https://repository.rit.edu/cgi/viewcontent.cgi?article=13455&context=theses
+   14. [R] Universal Transformers : r/MachineLearning - Reddit, tilgået januar 12, 2026, https://www.reddit.com/r/MachineLearning/comments/8y98b9/r_universal_transformers/
+   15. Proceedings of the 9th Student Computing Research Symposium (SCORES'23), tilgået januar 12, 2026, https://www.scores.si/assets/pdf/scores2023.pdf
+   16. Probabilistic and Causal Inference: The Works of Judea Pearl - FTP Directory Listing, tilgået januar 12, 2026, https://ftp.cs.ucla.edu/pub/stat_ser/ACMBook-published-2022.pdf
+   17. ICLR 2022 Spotlights, tilgået januar 12, 2026, https://iclr.cc/virtual/2022/events/Spotlight
+   18. EI Seminar - Zico Kolter - Recent Advances in Deep Equilibrium Models - YouTube, tilgået januar 12, 2026, https://www.youtube.com/watch?v=L6e_7bGDYdc
+   19. Control-Oriented Model-Based Reinforcement Learning with Implicit Differentiation, tilgået januar 12, 2026, https://www.researchgate.net/publication/352208825_Control-Oriented_Model-Based_Reinforcement_Learning_with_Implicit_Differentiation
+   20. [1909.01377] Deep Equilibrium Models - arXiv, tilgået januar 12, 2026, https://arxiv.org/abs/1909.01377
+   21. SCALING UP AND STABILIZING DIF FERENTIABLE PLANNING WITH IMPLICIT DIF FERENTIATION - OpenReview, tilgået januar 12, 2026, https://openreview.net/pdf/7529776dc3c4786cb7be99ab7976e5b370de107c.pdf
+   22. Request to add GTrXL: Stabilizing Transformers for Reinforcement Learning · Issue #36220, tilgået januar 12, 2026, https://github.com/huggingface/transformers/issues/36220
+   23. [PDF] Stabilizing Transformers for Reinforcement Learning - Semantic Scholar, tilgået januar 12, 2026, https://www.semanticscholar.org/paper/Stabilizing-Transformers-for-Reinforcement-Learning-Parisotto-Song/59a916cdc943f0282908e6f3fa0360f4c5fb78d0
+   24. GTrXL — DI-engine 0.1.0 documentation, tilgået januar 12, 2026, https://opendilab.github.io/DI-engine/12_policies/gtrxl.html
+   25. The Transformer Family | Lil'Log, tilgået januar 12, 2026, https://lilianweng.github.io/posts/2020-04-07-the-transformer-family/
+   26. Mastering Chess with a Transformer Model - arXiv, tilgået januar 12, 2026, https://arxiv.org/html/2409.12272v1
+   27. Mastering Chess with a Transformer Model - arXiv, tilgået januar 12, 2026, https://arxiv.org/html/2409.12272v2
+   28. [2409.12272] Mastering Chess with a Transformer Model - arXiv, tilgået januar 12, 2026, https://arxiv.org/abs/2409.12272
+   29. Muesli: Combining Improvements in Policy Optimization - arXiv, tilgået januar 12, 2026, https://arxiv.org/pdf/2104.06159
+   30. Mastering Atari, Go, Chess and Shogi by Planning with a Learned Model - arXiv, tilgået januar 12, 2026, https://arxiv.org/pdf/1911.08265
+   31. Muesli: MuZero without MCTS - by Aznaur Aliev - Medium, tilgået januar 12, 2026, https://medium.com/@al.aznaur/muesli-muzero-without-mcts-4172144b1569
+   32. Muesli: Combining Improvements in Policy Optimization - Proceedings of Machine Learning Research, tilgået januar 12, 2026, http://proceedings.mlr.press/v139/hessel21a/hessel21a.pdf
+   33. The Value Equivalence Principle for Model-Based Reinforcement Learning - Deep Blue Repositories, tilgået januar 12, 2026, https://deepblue.lib.umich.edu/bitstream/handle/2027.42/174289/crgrimm_1.pdf?sequence=1
+   34. Accurate Quantized Training (AQT) for TPU v5e | Google Cloud Blog, tilgået januar 12, 2026, https://cloud.google.com/blog/products/compute/accurate-quantized-training-aqt-for-tpu-v5e
+   35. google/aqt - GitHub, tilgået januar 12, 2026, https://github.com/google/aqt
+   36. [2208.07339] LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale - arXiv, tilgået januar 12, 2026, https://arxiv.org/abs/2208.07339
+   37. GPU performance tips - JAX documentation, tilgået januar 12, 2026, https://docs.jax.dev/en/latest/gpu_performance_tips.html
+   38. Sparse Distillation: Speeding Up Text Classification by Using Bigger Student Models - arXiv, tilgået januar 12, 2026, https://arxiv.org/abs/2110.08536
+   39. MiniALBERT: Model Distillation via Parameter-Efficient Recursive Transformers - ACL Anthology, tilgået januar 12, 2026, https://aclanthology.org/2023.eacl-main.83.pdf
+   40. Accelerated JAX on Mac - Metal - Apple Developer, tilgået januar 12, 2026, https://developer.apple.com/metal/jax/
+   41. JAX Metal: Random Number Generation Performance Issue #31286 - GitHub, tilgået januar 12, 2026, https://github.com/jax-ml/jax/issues/31286
+   42. It's a JAX, JAX, JAX, JAX World | Statistical Modeling, Causal Inference, and Social Science, tilgået januar 12, 2026, https://statmodeling.stat.columbia.edu/2025/10/03/its-a-jax-jax-jax-jax-world/
+   43. How to extract intermediate values from "underneath" `vmap`? · google flax · Discussion #1934 - GitHub, tilgået januar 12, 2026, https://github.com/google/flax/discussions/1934
+   44. Towards Piece-by-Piece Explanations for Chess Positions with SHAP - arXiv, tilgået januar 12, 2026, https://arxiv.org/html/2510.25775v1

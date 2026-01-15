@@ -1,0 +1,7 @@
+jax==0.4.35
+jaxlib==0.4.35
+flax
+optax
+pgx
+aqt
+jax-metal==0.1.1
