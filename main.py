@@ -120,8 +120,10 @@ def main():
     apply_patch()
     
     # 1. Initialize Environment
-    # Optimal batch size based on testing: 2048 gives best steps/sec
-    BATCH_SIZE = 2048
+    # With XLA memory optimization, we now have much more VRAM available
+    # Previous: 17.4GB used → Now: 5.5GB used = 17.5GB FREE!
+    # Can run 4x more games in parallel
+    BATCH_SIZE = 8192  # 4x increase from 2048!
     print(f"Initializing environment (batch_size={BATCH_SIZE})...", flush=True)
     env = RecurseEnv(batch_size=BATCH_SIZE)
     key = jax.random.PRNGKey(42)
