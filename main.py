@@ -299,7 +299,28 @@ def main():
     print(f"  Games played: {total_games:,}")
     if total_games > 0:
         print(f"  Win rate: {100*total_wins/total_games:.1f}%")
+    
+    # 7. Save Model
+    print()
+    print("=" * 60)
+    print("💾 SAVING MODEL")
+    print("=" * 60)
+    
+    from training.checkpoint import save_checkpoint, export_for_inference
+    
+    # Save checkpoint
+    ckpt_path = save_checkpoint(train_state.params, NUM_STEPS)
+    print(f"  ✓ Checkpoint: {ckpt_path}")
+    
+    # Export for inference
+    model_path = export_for_inference(train_state.params, "recurse_zero_model.pkl")
+    
+    print()
+    print("🎮 To test the model, use:")
+    print("   from training.checkpoint import load_checkpoint")
+    print("   checkpoint = load_checkpoint('checkpoints')")
     print()
 
 if __name__ == "__main__":
     main()
+
