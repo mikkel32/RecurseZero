@@ -3,11 +3,11 @@
 RecurseZero: GPU-Resident Chess RL Agent
 Main training script with live progress monitoring.
 
-Key improvements:
-- 10,000 training steps (from 50)
-- Game auto-reset when terminated
-- Win/Loss/Draw tracking
-- Reduced DEQ iterations for 2x speed
+Key features:
+- BFloat16 mixed precision (2x memory, faster compute)
+- 4096 batch size (massive parallelism)
+- DEQ with Anderson Acceleration
+- Muesli policy optimization (search-free)
 """
 
 print("=" * 60)
@@ -17,8 +17,9 @@ print()
 
 import sys
 import time
+import subprocess
 
-# Try to import rich for beautiful output, fallback to plain print
+# Try to import rich for beautiful output
 try:
     from rich.console import Console
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -34,6 +35,15 @@ import jax
 import jax.numpy as jnp
 print(f"✓ JAX loaded (backend: {jax.default_backend()})", flush=True)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CRITICAL: Initialize mixed precision BEFORE importing models!
+# This ensures get_dtype() returns BF16 when models are constructed
+# ═══════════════════════════════════════════════════════════════════════════════
+print("Initializing mixed precision...", flush=True)
+from optimization.mixed_precision import init_mixed_precision, get_dtype, is_bf16_enabled
+init_mixed_precision(enable=True)
+print(f"  Compute dtype: {get_dtype()}", flush=True)
+
 print("Loading Optax...", flush=True)
 import optax
 print("✓ Optax loaded", flush=True)
@@ -42,8 +52,9 @@ print("Loading environment...", flush=True)
 from env.pgx_wrapper import RecurseEnv
 print("✓ Environment loaded", flush=True)
 
+# NOW import models (after BF16 is initialized)
 print("Loading model...", flush=True)
-from model.agent import RecurseZeroAgent
+from model.agent import RecurseZeroAgent, RecurseZeroAgentFast
 print("✓ Model loaded", flush=True)
 
 print("Loading training loop...", flush=True)
@@ -53,8 +64,6 @@ print("✓ Training loop loaded", flush=True)
 print("Loading hardware config...", flush=True)
 from optimization.hardware_compat import setup_jax_platform
 print("✓ Hardware config loaded", flush=True)
-
-import subprocess
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GPU MONITORING
@@ -98,12 +107,8 @@ def main():
     
     setup_jax_platform()
     
-    # Initialize BFloat16 Mixed Precision (2x memory savings, 1.5x speedup)
-    try:
-        from optimization.mixed_precision import init_mixed_precision
-        init_mixed_precision(enable=True)
-    except ImportError:
-        print("⚪ Mixed precision not available")
+    # BF16 is already initialized above
+    print(f"✓ Using dtype: {get_dtype()}")
     
     # Apply Metal Patch for Pgx
     print("Applying Pgx patches...", flush=True)
@@ -111,8 +116,7 @@ def main():
     apply_patch()
     
     # 1. Initialize Environment
-    # Increased batch size: with BF16 we have more VRAM headroom
-    BATCH_SIZE = 4096  # 2x more games in parallel!
+    BATCH_SIZE = 4096  # Large batch for throughput
     print(f"Initializing environment (batch_size={BATCH_SIZE})...", flush=True)
     env = RecurseEnv(batch_size=BATCH_SIZE)
     key = jax.random.PRNGKey(42)
@@ -121,26 +125,25 @@ def main():
     env_state = env.init(env_key)
     print(f"✓ Environment: Batch={BATCH_SIZE}, Actions={env.num_actions}", flush=True)
     
-    # 2. Initialize Model with BFloat16 parameters
+    # 2. Initialize Model (BF16 is already set globally)
     print("Initializing model...", flush=True)
-    from model.agent import RecurseZeroAgentFast
     agent = RecurseZeroAgentFast(num_actions=env.num_actions)
     
-    # Initialize with BF16 for memory savings
-    from optimization.mixed_precision import is_bf16_enabled
-    if is_bf16_enabled():
-        dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=jnp.bfloat16)
-    else:
-        dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
+    # Use the correct dtype for dummy input
+    dummy_dtype = get_dtype()
+    dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=dummy_dtype)
     
     key, init_key = jax.random.split(key)
     params = agent.init(init_key, dummy_obs)
-    print("✓ Model initialized (Fast variant + BF16)", flush=True)
     
-    # 3. Optimizer Setup with gradient scaling for BF16 stability
+    # Verify dtype
+    sample_param = jax.tree_util.tree_leaves(params)[0]
+    print(f"✓ Model initialized (param dtype: {sample_param.dtype})", flush=True)
+    
+    # 3. Optimizer Setup
     print("Setting up optimizer...", flush=True)
     optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),  # Gradient clipping for stability
+        optax.clip_by_global_norm(1.0),
         optax.adamw(learning_rate=3e-4, weight_decay=0.01)
     )
     train_state = TrainState.create(
@@ -148,7 +151,7 @@ def main():
         params=params,
         tx=optimizer
     )
-    print("✓ Optimizer ready (with gradient scaling)", flush=True)
+    print("✓ Optimizer ready", flush=True)
     
     # 4. JIT Warmup
     print()
@@ -167,20 +170,13 @@ def main():
     jax.block_until_ready(warmup_metrics['total_loss'])
     
     warmup_time = time.time() - warmup_start
-    print(f"✓ JIT Compilation complete in {warmup_time:.1f}s", flush=True)
-    
     gpu_stats = get_gpu_stats()
-    print(f"  {format_gpu_str(gpu_stats)}", flush=True)
+    print(f"✓ JIT Compilation complete in {warmup_time:.1f}s")
+    print(f"  {format_gpu_str(gpu_stats)}")
     
-    # 5. Training Loop - INCREASED TO 10000 STEPS
+    # 5. Training Loop
     NUM_STEPS = 10000
     PRINT_EVERY = 100
-    
-    step_times = []
-    total_games = 0
-    total_wins = 0
-    total_losses = 0
-    total_draws = 0
     
     print()
     print("=" * 60)
@@ -188,21 +184,23 @@ def main():
     print("=" * 60)
     print()
     
-    training_start = time.time()
+    step_times = []
+    total_games = 0
+    total_wins = 0
+    total_losses = 0
+    total_draws = 0
     
     if RICH_AVAILABLE:
         with Progress(
             SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(bar_width=40),
+            TextColumn("[bold blue]Training...[/]"),
+            BarColumn(),
             TaskProgressColumn(),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
             console=console,
-            expand=True
         ) as progress:
-            
-            train_task = progress.add_task("[cyan]Training...", total=NUM_STEPS)
+            train_task = progress.add_task("Training", total=NUM_STEPS)
             
             for i in range(NUM_STEPS):
                 step_start = time.time()
@@ -216,7 +214,6 @@ def main():
                 step_time = time.time() - step_start
                 step_times.append(step_time)
                 
-                # Accumulate game stats
                 total_games += int(metrics['games_finished'])
                 total_wins += int(metrics['wins'])
                 total_losses += int(metrics['losses'])
@@ -231,15 +228,9 @@ def main():
                 if i % PRINT_EVERY == 0 or i == NUM_STEPS - 1:
                     gpu_stats = get_gpu_stats()
                     loss_val = float(metrics['total_loss'])
-                    reward_val = float(metrics['mean_reward'])
-                    entropy_val = float(metrics.get('policy_entropy', 0))
-                    games_this_step = int(metrics['games_finished'])
                     
-                    # Spec 5.2: Win probability from value
                     win_prob = float(metrics.get('win_probability', 0.5))
                     confidence = float(metrics.get('confidence', 0.5))
-                    
-                    win_rate = (total_wins / total_games * 100) if total_games > 0 else 0
                     
                     progress.console.print(
                         f"  Step {i:5d} │ "
@@ -269,54 +260,34 @@ def main():
             total_losses += int(metrics['losses'])
             total_draws += int(metrics['draws'])
             
-            if i % PRINT_EVERY == 0 or i == NUM_STEPS - 1:
-                gpu_stats = get_gpu_stats()
-                loss_val = float(metrics['total_loss'])
-                reward_val = float(metrics['mean_reward'])
-                entropy_val = float(metrics.get('policy_entropy', 0))
-                
+            if i % PRINT_EVERY == 0:
                 recent_times = step_times[-50:]
                 avg_step_time = sum(recent_times) / len(recent_times)
                 steps_per_sec = 1.0 / avg_step_time if avg_step_time > 0 else 0
                 
-                win_rate = (total_wins / total_games * 100) if total_games > 0 else 0
-                
-                print(
-                    f"Step {i:5d}/{NUM_STEPS} │ "
-                    f"Loss: {loss_val:7.4f} │ "
-                    f"Reward: {reward_val:+6.3f} │ "
-                    f"Games: {total_games:,} W:{total_wins}/L:{total_losses}/D:{total_draws} │ "
-                    f"WinRate: {win_rate:.1f}% │ "
-                    f"{steps_per_sec:.1f} s/s │ "
-                    f"{format_gpu_str(gpu_stats)}",
-                    flush=True
-                )
+                print(f"Step {i:5d} | Loss: {float(metrics['total_loss']):.4f} | "
+                      f"Games: {total_games} | {steps_per_sec:.1f} s/s")
     
-    # Final Summary
-    total_training_time = time.time() - training_start
+    # 6. Training Complete
+    print()
+    print("=" * 60)
+    print("TRAINING COMPLETE")
+    print("=" * 60)
+    
     total_time = sum(step_times)
-    avg_steps_per_sec = NUM_STEPS / total_time if total_time > 0 else 0
-    positions_per_sec = avg_steps_per_sec * BATCH_SIZE
+    avg_speed = NUM_STEPS / total_time if total_time > 0 else 0
     
-    print()
-    print("=" * 60)
-    print("✓ TRAINING COMPLETE!")
-    print("=" * 60)
-    print(f"  Steps:          {NUM_STEPS:,}")
-    print(f"  Time:           {total_training_time:.1f}s (+ {warmup_time:.1f}s compile)")
-    print(f"  Speed:          {avg_steps_per_sec:.2f} steps/sec")
-    print(f"  Positions/sec:  {positions_per_sec:,.0f}")
-    print(f"  Final Loss:     {float(metrics['total_loss']):.4f}")
-    print()
-    print("  📊 Game Statistics:")
-    print(f"     Total Games: {total_games:,}")
-    print(f"     Wins:        {total_wins:,} ({total_wins/max(total_games,1)*100:.1f}%)")
-    print(f"     Losses:      {total_losses:,} ({total_losses/max(total_games,1)*100:.1f}%)")
-    print(f"     Draws:       {total_draws:,} ({total_draws/max(total_games,1)*100:.1f}%)")
-    print()
+    print(f"  Total steps: {NUM_STEPS:,}")
+    print(f"  Total time: {total_time:.1f}s")
+    print(f"  Avg speed: {avg_speed:.2f} steps/s")
+    print(f"  Compute dtype: {get_dtype()}")
+    print(f"  Total games: {total_games:,}")
+    print(f"  Wins/Losses/Draws: {total_wins}/{total_losses}/{total_draws}")
     
-    gpu_stats = get_gpu_stats()
-    print(f"  {format_gpu_str(gpu_stats)}")
+    win_rate = total_wins / max(1, total_games) * 100
+    draw_rate = total_draws / max(1, total_games) * 100
+    print(f"  Win rate: {win_rate:.1f}%")
+    print(f"  Draw rate: {draw_rate:.1f}%")
     print()
 
 if __name__ == "__main__":
