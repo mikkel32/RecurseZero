@@ -87,8 +87,9 @@ from env.pgx_wrapper import RecurseEnv
 print("✓ Environment loaded", flush=True)
 
 print("Loading model...", flush=True)
-from model.agent import RecurseZeroAgentFast
-print("✓ Model loaded", flush=True)
+# Use SIMPLE agent (no DEQ) for speed baseline - should be MUCH faster
+from model.agent import RecurseZeroAgentSimple as Agent
+print("✓ Model loaded (Simple variant - no DEQ)", flush=True)
 
 print("Loading training loop...", flush=True)
 from training.loop import TrainState, resident_train_step
@@ -145,9 +146,9 @@ def main():
     stats = get_gpu_stats()
     print(f"  After env init: {stats['mem_used']}MB used")
     
-    # 2. Initialize Model
+    # 2. Initialize Model (Simple agent without DEQ for speed)
     print("Initializing model...", flush=True)
-    agent = RecurseZeroAgentFast(num_actions=env.num_actions)
+    agent = Agent(num_actions=env.num_actions)
     dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
     
     key, init_key = jax.random.split(key)
