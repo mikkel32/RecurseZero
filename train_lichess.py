@@ -149,11 +149,162 @@ def get_lichess_database(month: str = "2019-09", max_gb: float = 1.0) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FAST PGN PARSING (Optimized)
+# INTELLIGENT PGN PARSING WITH STOCKFISH EVALS
+# Uses Pgx-style 119-plane encoding for GPU compatibility
 # ═══════════════════════════════════════════════════════════════════════════════
 
+import re
+
+# Regex to extract Stockfish eval from comment
+EVAL_PATTERN = re.compile(r'\[%eval ([+-]?\d+\.?\d*|#[+-]?\d+)\]')
+
+
+def extract_eval(comment: str) -> float:
+    """
+    Extract Stockfish evaluation from PGN comment.
+    
+    Returns:
+        Float in range [-1, 1] (normalized centipawn or mate score)
+    """
+    if not comment:
+        return None
+    
+    match = EVAL_PATTERN.search(comment)
+    if not match:
+        return None
+    
+    eval_str = match.group(1)
+    
+    # Mate score: #4 = mate in 4
+    if eval_str.startswith('#'):
+        mate_in = int(eval_str[1:])
+        # Normalize mate: faster mate = closer to +/-1
+        return 1.0 if mate_in > 0 else -1.0
+    
+    # Centipawn score: normalize to [-1, 1]
+    cp = float(eval_str)
+    # Sigmoid-like normalization: 3 pawns advantage ≈ 95% win
+    normalized = 2.0 / (1.0 + 10.0 ** (-cp / 4.0)) - 1.0
+    return max(-1.0, min(1.0, normalized))
+
+
+def board_to_pgx_planes(board: chess.Board) -> list:
+    """
+    Convert board to Pgx-style 119-plane encoding.
+    
+    Planes 0-5:   White pieces (P, N, B, R, Q, K)
+    Planes 6-11:  Black pieces
+    Planes 12-15: Castling rights (KQkq)
+    Plane 16:     Side to move
+    Planes 17-18: En passant file
+    Planes 19+:   Repetition counter, halfmove clock (zeros for now)
+    """
+    planes = []
+    
+    # Piece planes (0-11): 6 piece types × 2 colors
+    for color in [chess.WHITE, chess.BLACK]:
+        for piece_type in range(1, 7):  # PAWN=1, KING=6
+            plane = [[0.0] * 8 for _ in range(8)]
+            for sq in board.pieces(piece_type, color):
+                rank, file = divmod(sq, 8)
+                plane[rank][file] = 1.0
+            planes.append(plane)
+    
+    # Castling rights (12-15)
+    for right in [
+        board.has_kingside_castling_rights(chess.WHITE),
+        board.has_queenside_castling_rights(chess.WHITE),
+        board.has_kingside_castling_rights(chess.BLACK),
+        board.has_queenside_castling_rights(chess.BLACK),
+    ]:
+        planes.append([[float(right)] * 8 for _ in range(8)])
+    
+    # Side to move (16)
+    planes.append([[float(board.turn)] * 8 for _ in range(8)])
+    
+    # En passant (17): file indicator
+    ep_plane = [[0.0] * 8 for _ in range(8)]
+    if board.ep_square is not None:
+        ep_file = board.ep_square % 8
+        for rank in range(8):
+            ep_plane[rank][ep_file] = 1.0
+    planes.append(ep_plane)
+    
+    # Halfmove clock normalized (18)
+    halfmove = min(board.halfmove_clock / 100.0, 1.0)
+    planes.append([[halfmove] * 8 for _ in range(8)])
+    
+    # Fullmove number normalized (19)
+    fullmove = min(board.fullmove_number / 200.0, 1.0)
+    planes.append([[fullmove] * 8 for _ in range(8)])
+    
+    # Pad remaining planes with zeros to reach 119
+    while len(planes) < 119:
+        planes.append([[0.0] * 8 for _ in range(8)])
+    
+    return planes[:119]
+
+
+def move_to_pgx_action(move: chess.Move, board: chess.Board) -> int:
+    """
+    Convert move to Pgx-compatible action index.
+    
+    Action space: 64 squares × 73 move types = 4672
+    - Queen moves: 56 (8 directions × 7 distances)
+    - Knight moves: 8
+    - Underpromotions: 9 (3 piece types × 3 directions)
+    """
+    from_sq = move.from_square
+    to_sq = move.to_square
+    
+    # Direction and distance
+    rank_diff = (to_sq // 8) - (from_sq // 8)
+    file_diff = (to_sq % 8) - (from_sq % 8)
+    
+    # Knight moves (8 types)
+    knight_moves = [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
+    for i, (dr, df) in enumerate(knight_moves):
+        if rank_diff == dr and file_diff == df:
+            return from_sq * 73 + 56 + i
+    
+    # Queen moves (56 types: 8 directions × 7 distances)
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+    for dir_idx, (dr, df) in enumerate(directions):
+        if dr != 0 and df != 0:  # Diagonal
+            if rank_diff != 0 and abs(rank_diff) == abs(file_diff) and \
+               (rank_diff // abs(rank_diff) == dr) and (file_diff // abs(file_diff) == df):
+                distance = abs(rank_diff) - 1
+                return from_sq * 73 + dir_idx * 7 + distance
+        elif dr != 0:  # Vertical
+            if file_diff == 0 and rank_diff != 0 and (rank_diff // abs(rank_diff) == dr):
+                distance = abs(rank_diff) - 1
+                return from_sq * 73 + dir_idx * 7 + distance
+        else:  # Horizontal
+            if rank_diff == 0 and file_diff != 0 and (file_diff // abs(file_diff) == df):
+                distance = abs(file_diff) - 1
+                return from_sq * 73 + dir_idx * 7 + distance
+    
+    # Underpromotions (9 types)
+    if move.promotion and move.promotion != chess.QUEEN:
+        promo_map = {chess.ROOK: 0, chess.BISHOP: 1, chess.KNIGHT: 2}
+        promo_idx = promo_map.get(move.promotion, 0)
+        dir_idx = 1 + file_diff  # 0=left, 1=straight, 2=right
+        return from_sq * 73 + 64 + promo_idx * 3 + dir_idx
+    
+    # Default: from * 73 + to (fallback)
+    return (from_sq * 73 + to_sq) % 4672
+
+
 def parse_single_game(game_text: str) -> List[Tuple]:
-    """Parse a single PGN game to positions (CPU worker)."""
+    """
+    Parse PGN game with intelligent feature extraction.
+    
+    Extracts:
+    - Pgx-style 119-plane board encoding
+    - Pgx-compatible action encoding
+    - Stockfish eval as training target (if available)
+    - Falls back to game result
+    """
     positions = []
     
     try:
@@ -161,7 +312,7 @@ def parse_single_game(game_text: str) -> List[Tuple]:
         if not game:
             return []
         
-        # Get result
+        # Get result as fallback
         result_str = game.headers.get('Result', '*')
         if result_str == '1-0':
             white_result = 1.0
@@ -170,35 +321,41 @@ def parse_single_game(game_text: str) -> List[Tuple]:
         else:
             white_result = 0.0
         
-        board = game.board()
+        # Get ELO for filtering quality games
+        try:
+            white_elo = int(game.headers.get('WhiteElo', 0))
+            black_elo = int(game.headers.get('BlackElo', 0))
+            avg_elo = (white_elo + black_elo) // 2
+        except:
+            avg_elo = 0
         
-        for move in game.mainline_moves():
-            # Simple board encoding (fast)
-            planes = []
-            for color in [chess.WHITE, chess.BLACK]:
-                for piece_type in range(1, 7):
-                    plane = [[0.0] * 8 for _ in range(8)]
-                    for sq in board.pieces(piece_type, color):
-                        rank, file = divmod(sq, 8)
-                        plane[rank][file] = 1.0
-                    planes.append(plane)
+        board = game.board()
+        node = game
+        
+        for node in game.mainline():
+            move = node.move
+            comment = node.comment
             
-            # Pad to 17 planes (minimal)
-            while len(planes) < 17:
-                planes.append([[0.0] * 8 for _ in range(8)])
+            # Get Stockfish eval if available (SMARTER target!)
+            sf_eval = extract_eval(comment)
             
-            obs = planes[:17]  # (17, 8, 8)
+            if sf_eval is not None:
+                # Use Stockfish eval (much better than game result!)
+                target = sf_eval if board.turn == chess.WHITE else -sf_eval
+            else:
+                # Fall back to game result
+                target = white_result if board.turn == chess.WHITE else -white_result
             
-            # Action encoding
-            action = (move.from_square * 73 + move.to_square) % 4672
+            # Pgx-style board encoding
+            obs = board_to_pgx_planes(board)
             
-            # Result
-            result = white_result if board.turn == chess.WHITE else -white_result
+            # Pgx-compatible action
+            action = move_to_pgx_action(move, board)
             
-            positions.append((obs, action, result))
+            positions.append((obs, action, target))
             board.push(move)
             
-    except Exception:
+    except Exception as e:
         pass
     
     return positions
@@ -284,38 +441,63 @@ def parallel_parse_games(games: List[str], max_positions: int, num_workers: int 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GPU DATA LOADING (100% GPU after this point)
+# Supports QUANTIZED data to fit 4x more positions in VRAM
+# Uses Pgx-style 119-plane encoding for full GPU compatibility
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_to_gpu(all_obs, all_actions, all_results):
-    """Transfer all data to GPU VRAM."""
+def load_to_gpu(all_obs, all_actions, all_results, quantize: bool = True):
+    """
+    Transfer all data to GPU VRAM.
+    
+    Input format: observations are (N, 119, 8, 8) from Pgx-style encoding
+    Output format: (N, 8, 8, 119) for model (NHWC)
+    
+    Args:
+        quantize: If True, use Int8 for observations (4x memory savings)
+    """
     print("📤 Transferring to GPU VRAM...")
     
-    # Convert to numpy first (faster)
     import numpy as np
     
-    # Reshape observations: (N, 17, 8, 8) -> (N, 8, 8, 17)
+    # Convert observations: (N, 119, 8, 8) -> (N, 8, 8, 119)
     obs_np = np.array(all_obs, dtype=np.float32)
     obs_np = np.transpose(obs_np, (0, 2, 3, 1))  # NCHW -> NHWC
     
-    # Pad to 119 channels for compatibility
     N = obs_np.shape[0]
-    obs_padded = np.zeros((N, 8, 8, 119), dtype=np.float32)
-    obs_padded[:, :, :, :17] = obs_np
+    print(f"   Positions: {N:,} | Planes: {obs_np.shape[-1]}")
     
-    actions_np = np.array(all_actions, dtype=np.int32)
-    results_np = np.array(all_results, dtype=np.float32)
+    if quantize:
+        # QUANTIZED: Use Int8 for observations (4x memory savings)
+        print("   Quantization: Int8 observations (4x memory savings)")
+        
+        # Scale to Int8 range and convert
+        obs_int8 = (obs_np * 127).astype(np.int8)
+        
+        actions_np = np.array(all_actions, dtype=np.int16)
+        results_np = np.array(all_results, dtype=np.float16)
+        
+        # Transfer to GPU
+        obs = jax.device_put(jnp.array(obs_int8))
+        actions = jax.device_put(jnp.array(actions_np))
+        results = jax.device_put(jnp.array(results_np))
+        
+    else:
+        # Full precision (FP32)
+        obs_padded = np.zeros((N, 8, 8, 119), dtype=np.float32)
+        obs_padded[:, :, :, :17] = obs_np
+        
+        actions_np = np.array(all_actions, dtype=np.int32)
+        results_np = np.array(all_results, dtype=np.float32)
+        
+        obs = jax.device_put(jnp.array(obs_padded))
+        actions = jax.device_put(jnp.array(actions_np))
+        results = jax.device_put(jnp.array(results_np))
     
-    # Transfer to GPU
-    obs = jax.device_put(jnp.array(obs_padded))
-    actions = jax.device_put(jnp.array(actions_np))
-    results = jax.device_put(jnp.array(results_np))
-    
-    # Wait for transfer
     jax.block_until_ready(obs)
     
     total_bytes = obs.nbytes + actions.nbytes + results.nbytes
     print(f"✓ Data in VRAM: {total_bytes / (1024**3):.2f} GB")
-    print(f"   Shape: {obs.shape}")
+    print(f"   Shape: {obs.shape} | dtype: {obs.dtype}")
     
     return obs, actions, results
 
@@ -334,10 +516,25 @@ def sample_batch(key, obs, actions, results, batch_size):
 
 @jax.jit
 def train_step(state, obs, actions, results):
-    """Training step - 100% on GPU."""
+    """
+    Training step - 100% on GPU.
+    
+    Handles Int8 quantized observations (dequantizes to float32).
+    """
     def loss_fn(params):
-        policy_logits, values, _ = state.apply_fn(params, obs)
+        # Dequantize Int8 observations if needed
+        if obs.dtype == jnp.int8:
+            obs_float = obs.astype(jnp.float32) / 127.0
+            # Pad to 119 channels for model compatibility
+            obs_padded = jnp.pad(obs_float, ((0, 0), (0, 0), (0, 0), (0, 119 - obs_float.shape[-1])))
+        else:
+            obs_padded = obs
+        
+        policy_logits, values, _ = state.apply_fn(params, obs_padded)
         values = jnp.squeeze(values, -1)
+        
+        # Cast results to float32 if needed (may be float16)
+        results_f32 = results.astype(jnp.float32)
         
         # Policy loss (cross-entropy)
         log_probs = jax.nn.log_softmax(policy_logits)
@@ -345,7 +542,7 @@ def train_step(state, obs, actions, results):
         policy_loss = -jnp.mean(jnp.sum(log_probs * one_hot, axis=-1))
         
         # Value loss (MSE)
-        value_loss = jnp.mean((values - results) ** 2)
+        value_loss = jnp.mean((values - results_f32) ** 2)
         
         # Accuracy
         predicted = jnp.argmax(policy_logits, axis=-1)
@@ -366,10 +563,11 @@ def train_step(state, obs, actions, results):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--month', default='2019-09', help='Database month (YYYY-MM)')
-    parser.add_argument('--games', type=int, default=10000, help='Max games')
-    parser.add_argument('--positions', type=int, default=200000, help='Max positions')
-    parser.add_argument('--steps', type=int, default=5000, help='Training steps')
-    parser.add_argument('--batch_size', type=int, default=2048, help='Batch size')
+    # INCREASED DEFAULTS for better training
+    parser.add_argument('--games', type=int, default=100000, help='Max games')
+    parser.add_argument('--positions', type=int, default=1000000, help='Max positions')
+    parser.add_argument('--steps', type=int, default=20000, help='Training steps')
+    parser.add_argument('--batch_size', type=int, default=4096, help='Batch size')
     parser.add_argument('--max_gb', type=float, default=1.0, help='Max download GB')
     parser.add_argument('--output', default='lichess_model.pkl', help='Output path')
     args = parser.parse_args()
