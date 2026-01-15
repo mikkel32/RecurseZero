@@ -74,11 +74,19 @@ def resident_train_step(
     # 4. Optimizer Step
     new_state = state.apply_gradients(grads=grads)
     
+    # 5. Calculate Policy Entropy for monitoring (H = -Σ π log π)
+    probs = jax.nn.softmax(policy_logits, axis=-1)
+    log_probs = jnp.log(probs + 1e-8)  # Numerical stability
+    entropy = -jnp.sum(probs * log_probs, axis=-1)
+    mean_entropy = jnp.mean(entropy)
+    
     metrics = {
         'total_loss': pg_loss + pve_loss_val,
         'pg_loss': pg_loss,
         'pve_loss': pve_loss_val,
-        'mean_reward': jnp.mean(rewards_flat)
+        'mean_reward': jnp.mean(rewards_flat),
+        'policy_entropy': mean_entropy,
+        'mean_value': jnp.mean(values),
     }
     
     return new_state, next_env_state, metrics

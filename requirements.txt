@@ -1,7 +1,8 @@
-jax==0.4.35
-jaxlib==0.4.35
+jax[cuda12]
 flax
 optax
 pgx
+rich>=13.0.0
+pynvml>=11.0.0
 aqt
 jax-metal==0.1.1
