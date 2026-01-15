@@ -52,6 +52,41 @@ import requests
 import io
 from tqdm import tqdm
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GPU MONITORING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_gpu_stats():
+    """Get GPU stats (usage, memory, temperature)."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu',
+             '--format=csv,nounits,noheader'],
+            capture_output=True, text=True, timeout=1
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(',')
+            if len(parts) >= 4:
+                return {
+                    'gpu': int(parts[0].strip()),
+                    'mem_used': int(parts[1].strip()),
+                    'mem_total': int(parts[2].strip()),
+                    'temp': int(parts[3].strip()),
+                }
+    except Exception:
+        pass
+    return None
+
+
+def format_gpu_stats():
+    """Format GPU stats for display."""
+    stats = get_gpu_stats()
+    if stats:
+        return f"GPU:{stats['gpu']}% | {stats['mem_used']//1024}G/{stats['mem_total']//1024}G | {stats['temp']}°C"
+    return ""
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FAST DOWNLOAD WITH LIVE PROGRESS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -433,6 +468,10 @@ def main():
     
     train_start = time.time()
     
+    # Show initial GPU status
+    print(f"   {format_gpu_stats()}")
+    print()
+    
     with tqdm(total=args.steps, desc="Training", unit="step") as pbar:
         for step in range(args.steps):
             key, batch_key = jax.random.split(key)
@@ -443,11 +482,12 @@ def main():
                 jax.block_until_ready(metrics['total_loss'])
                 elapsed = time.time() - train_start
                 speed = (step + 1) / elapsed if elapsed > 0 else 0
-                pbar.set_postfix({
-                    'loss': f"{float(metrics['total_loss']):.3f}",
-                    'acc': f"{float(metrics['accuracy']):.1%}",
-                    's/s': f"{speed:.0f}"
-                })
+                gpu = format_gpu_stats()
+                pbar.set_postfix_str(
+                    f"loss={float(metrics['total_loss']):.3f} | "
+                    f"acc={float(metrics['accuracy']):.1%} | "
+                    f"{speed:.0f}s/s | {gpu}"
+                )
             
             pbar.update(1)
     
