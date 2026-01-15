@@ -296,37 +296,46 @@ def collect_positions(filepath: str, max_games: int, max_positions: int):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GPU DATA LOADING
+# GPU DATA LOADING - MEMORY OPTIMIZED
+# Uses Int8 quantization to fit more data in VRAM
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_to_gpu(obs_np, actions_np, targets_np):
-    """Transfer numpy arrays to GPU."""
+    """
+    Transfer numpy arrays to GPU with Int8 quantization.
+    
+    17 planes × Int8 = 4x memory savings vs 119 planes × FP32!
+    """
     print("📤 Transferring to GPU VRAM...")
     
     # Transpose: (N, 17, 8, 8) -> (N, 8, 8, 17)
     obs_np = np.transpose(obs_np, (0, 2, 3, 1))
     
-    # Pad to 119 channels for model compatibility
     N = obs_np.shape[0]
-    obs_padded = np.zeros((N, 8, 8, 119), dtype=np.float32)
-    obs_padded[:, :, :, :17] = obs_np
+    
+    # Use Int8 quantization (4x memory savings)
+    # Piece planes are 0 or 1, so Int8 is perfect
+    obs_int8 = (obs_np * 127).astype(np.int8)
+    
+    print(f"   Positions: {N:,}")
+    print(f"   Obs memory: {obs_int8.nbytes / (1024**3):.2f} GB (Int8)")
     
     # Transfer to GPU
-    obs = jax.device_put(jnp.array(obs_padded))
+    obs = jax.device_put(jnp.array(obs_int8))
     actions = jax.device_put(jnp.array(actions_np.astype(np.int32)))
     targets = jax.device_put(jnp.array(targets_np))
     
     jax.block_until_ready(obs)
     
     total_bytes = obs.nbytes + actions.nbytes + targets.nbytes
-    print(f"✓ Data in VRAM: {total_bytes / (1024**3):.2f} GB")
-    print(f"   Shape: {obs.shape}")
+    print(f"✓ Total VRAM: {total_bytes / (1024**3):.2f} GB")
     
     return obs, actions, targets
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GPU TRAINING
+# Handles Int8 quantized 17-plane input, pads to 119 during forward pass
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @partial(jax.jit, static_argnames=['batch_size'])
@@ -338,8 +347,16 @@ def sample_batch(key, obs, actions, targets, batch_size):
 
 @jax.jit
 def train_step(state, obs, actions, targets):
+    """
+    Training step that handles Int8 quantized 17-plane input.
+    Dequantizes and pads to 119 planes during forward pass only.
+    """
     def loss_fn(params):
-        policy_logits, values, _ = state.apply_fn(params, obs)
+        # Dequantize Int8 -> FP32 and pad to 119 planes
+        obs_float = obs.astype(jnp.float32) / 127.0
+        obs_padded = jnp.pad(obs_float, ((0, 0), (0, 0), (0, 0), (0, 119 - 17)))
+        
+        policy_logits, values, _ = state.apply_fn(params, obs_padded)
         values = jnp.squeeze(values, -1)
         
         log_probs = jax.nn.log_softmax(policy_logits)
@@ -366,8 +383,8 @@ def train_step(state, obs, actions, targets):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--month', default='2019-09')
-    parser.add_argument('--games', type=int, default=50000, help='Max games')
-    parser.add_argument('--positions', type=int, default=500000, help='Max positions')
+    parser.add_argument('--games', type=int, default=20000, help='Max games')
+    parser.add_argument('--positions', type=int, default=200000, help='Max positions (fits in 22GB VRAM)')
     parser.add_argument('--steps', type=int, default=10000, help='Training steps')
     parser.add_argument('--batch_size', type=int, default=2048, help='Batch size')
     parser.add_argument('--max_gb', type=float, default=1.0)
