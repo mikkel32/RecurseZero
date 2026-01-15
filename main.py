@@ -99,15 +99,15 @@ def main():
     setup_jax_platform()
     
     # Initialize Int8 Quantization (2-4x speedup on Tensor Cores)
-    try:
-        from optimization.quantization import init_quantization
-        # Enable quantization on CUDA/Tensor Core hardware
-        if jax.default_backend() == 'gpu':
+    if jax.default_backend() == 'gpu':
+        try:
+            from optimization.quantization import init_quantization
             init_quantization(enable=True)
-        else:
-            print("⚪ Quantization skipped (not on CUDA GPU)")
-    except ImportError:
-        print("⚠ Quantization module not available")
+        except ImportError as e:
+            print(f"⚠ Quantization module error: {e}")
+            print("  Install with: pip install aqtp")
+    else:
+        print("⚪ Int8 skipped (requires CUDA GPU)")
     
     # Apply Metal Patch for Pgx
     print("Applying Pgx patches...", flush=True)
@@ -125,13 +125,16 @@ def main():
     print(f"✓ Environment: Batch={BATCH_SIZE}, Actions={env.num_actions}", flush=True)
     
     # 2. Initialize Model
+    # Use Fast variant for L4 GPU optimization
+    # For full spec compliance (slower), use RecurseZeroAgent instead
     print("Initializing model...", flush=True)
-    agent = RecurseZeroAgent(num_actions=env.num_actions)
+    from model.agent import RecurseZeroAgentFast
+    agent = RecurseZeroAgentFast(num_actions=env.num_actions)
     dummy_obs = jnp.zeros((1, *env.observation_shape), dtype=jnp.float32)
     
     key, init_key = jax.random.split(key)
     params = agent.init(init_key, dummy_obs)
-    print("✓ Model initialized", flush=True)
+    print("✓ Model initialized (Fast variant)", flush=True)
     
     # 3. Optimizer Setup
     print("Setting up optimizer...", flush=True)
@@ -228,14 +231,18 @@ def main():
                     entropy_val = float(metrics.get('policy_entropy', 0))
                     games_this_step = int(metrics['games_finished'])
                     
+                    # Spec 5.2: Win probability from value
+                    win_prob = float(metrics.get('win_probability', 0.5))
+                    confidence = float(metrics.get('confidence', 0.5))
+                    
                     win_rate = (total_wins / total_games * 100) if total_games > 0 else 0
                     
                     progress.console.print(
                         f"  Step {i:5d} │ "
                         f"Loss: {loss_val:7.4f} │ "
-                        f"Reward: {reward_val:+6.3f} │ "
+                        f"P(win): {win_prob:.1%} │ "
+                        f"Conf: {confidence:.0%} │ "
                         f"Games: {total_games:,} (W:{total_wins}/L:{total_losses}/D:{total_draws}) │ "
-                        f"WinRate: {win_rate:.1f}% │ "
                         f"{steps_per_sec:.1f} s/s │ "
                         f"{format_gpu_str(gpu_stats)}"
                     )
