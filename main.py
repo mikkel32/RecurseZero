@@ -120,10 +120,18 @@ def main():
     apply_patch()
     
     # 1. Initialize Environment
-    # With XLA memory optimization, we now have much more VRAM available
-    # Previous: 17.4GB used → Now: 5.5GB used = 17.5GB FREE!
-    # Can run 4x more games in parallel
-    BATCH_SIZE = 8192  # 4x increase from 2048!
+    # TESTED: batch 2048 gives best throughput (1.8 s/s × 2048 = 3686 pos/sec)
+    # Larger batch is slower per-step, doesn't improve total throughput
+    BATCH_SIZE = 2048
+    
+    # Verify we're on GPU-only (no CPU fallback)
+    devices = jax.devices()
+    print(f"JAX devices: {devices}")
+    if 'gpu' not in str(devices[0]).lower() and 'cuda' not in str(devices[0]).lower():
+        print("⚠️  WARNING: Not running on GPU! Check JAX installation.")
+    else:
+        print(f"✓ Confirmed GPU execution: {devices[0]}")
+    
     print(f"Initializing environment (batch_size={BATCH_SIZE})...", flush=True)
     env = RecurseEnv(batch_size=BATCH_SIZE)
     key = jax.random.PRNGKey(42)
