@@ -383,11 +383,12 @@ def train_step(state, obs, actions, targets):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--month', default='2019-09')
-    parser.add_argument('--games', type=int, default=20000, help='Max games')
-    parser.add_argument('--positions', type=int, default=200000, help='Max positions (fits in 22GB VRAM)')
-    parser.add_argument('--steps', type=int, default=10000, help='Training steps')
-    parser.add_argument('--batch_size', type=int, default=2048, help='Batch size')
-    parser.add_argument('--max_gb', type=float, default=1.0)
+    # SCALED UP: Int8 encoding is super efficient!
+    parser.add_argument('--games', type=int, default=100000, help='Max games')
+    parser.add_argument('--positions', type=int, default=1000000, help='Max positions (Int8 = 1GB for 1M!)')
+    parser.add_argument('--steps', type=int, default=20000, help='Training steps')
+    parser.add_argument('--batch_size', type=int, default=8192, help='Batch size (bigger = faster)')
+    parser.add_argument('--max_gb', type=float, default=2.0, help='Max download size')
     parser.add_argument('--output', default='lichess_model.pkl')
     args = parser.parse_args()
     
