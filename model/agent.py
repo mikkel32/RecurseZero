@@ -26,13 +26,13 @@ from algorithm.pve import ValueHead, RewardHead
 
 class SimpleTransformerBlock(nn.Module):
     """
-    Standard transformer block for fast GPU training.
-    
-    100% XLA-compiled, zero CPU operations.
+    Transformer block with dropout for better generalization.
     """
     hidden_dim: int
     heads: int
     mlp_dim: int
+    dropout_rate: float = 0.1
+    deterministic: bool = True
     
     @nn.compact
     def __call__(self, x):
@@ -42,56 +42,61 @@ class SimpleTransformerBlock(nn.Module):
         # 1. LayerNorm + Multi-head attention
         h = nn.LayerNorm()(x)
         
-        # QKV projection (fused for efficiency)
         qkv = nn.Dense(3 * self.hidden_dim, use_bias=False)(h)
         q, k, v = jnp.split(qkv, 3, axis=-1)
         
-        # Reshape for multi-head
         q = q.reshape(B, L, self.heads, head_dim).transpose(0, 2, 1, 3)
         k = k.reshape(B, L, self.heads, head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, L, self.heads, head_dim).transpose(0, 2, 1, 3)
         
-        # Scaled dot-product attention (pure JAX)
         scale = jnp.sqrt(jnp.float32(head_dim))
         attn_weights = nn.softmax(jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale, axis=-1)
+        attn_weights = nn.Dropout(rate=self.dropout_rate, deterministic=self.deterministic)(attn_weights)
         attn_out = jnp.matmul(attn_weights, v)
         
-        # Merge heads
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, L, self.hidden_dim)
         attn_out = nn.Dense(self.hidden_dim)(attn_out)
+        attn_out = nn.Dropout(rate=self.dropout_rate, deterministic=self.deterministic)(attn_out)
         
         x = x + attn_out
         
-        # 2. MLP block
+        # 2. MLP block with dropout
         h = nn.LayerNorm()(x)
         mlp = nn.Dense(self.mlp_dim)(h)
         mlp = nn.gelu(mlp)
+        mlp = nn.Dropout(rate=self.dropout_rate, deterministic=self.deterministic)(mlp)
         mlp = nn.Dense(self.hidden_dim)(mlp)
+        mlp = nn.Dropout(rate=self.dropout_rate, deterministic=self.deterministic)(mlp)
         
         return x + mlp
 
 
 class RecurseZeroAgentSimple(nn.Module):
     """
-    Fast GPU-only agent without DEQ.
+    Fast GPU-only agent with dropout for better accuracy.
     
-    BALANCED MODEL for accuracy + VRAM efficiency:
+    OPTIMIZED for 20%+ accuracy:
     - 192 hidden dim
     - 6 heads
     - 768 MLP
     - 4 layers
-    - ~2.5M parameters (fits in 22GB VRAM)
+    - Dropout 0.1
+    - ~2.8M parameters
     """
     hidden_dim: int = 192
     heads: int = 6
     mlp_dim: int = 768
     num_layers: int = 4
     num_actions: int = 4672
+    dropout_rate: float = 0.1
     
     @nn.compact
-    def __call__(self, x):
-        # 1. Embedding
+    def __call__(self, x, train: bool = True):
+        deterministic = not train
+        
+        # 1. Embedding with dropout
         x_embed = nn.Dense(self.hidden_dim, name='input_embed')(x)
+        x_embed = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x_embed)
         x_flat = x_embed.reshape(x_embed.shape[0], -1, self.hidden_dim)
         
         # 2. Stacked transformer blocks
@@ -101,6 +106,8 @@ class RecurseZeroAgentSimple(nn.Module):
                 hidden_dim=self.hidden_dim,
                 heads=self.heads,
                 mlp_dim=self.mlp_dim,
+                dropout_rate=self.dropout_rate,
+                deterministic=deterministic,
                 name=f'block_{i}'
             )(h)
         

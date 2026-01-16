@@ -346,9 +346,9 @@ def sample_batch(key, obs, actions, targets, batch_size):
 
 
 @jax.jit
-def train_step(state, obs, actions, targets):
+def train_step(state, obs, actions, targets, dropout_key):
     """
-    Training step with label smoothing for better accuracy.
+    Training step with dropout and label smoothing for better accuracy.
     Handles Int8 quantized 17-plane input.
     """
     def loss_fn(params):
@@ -356,10 +356,14 @@ def train_step(state, obs, actions, targets):
         obs_float = obs.astype(jnp.float32) / 127.0
         obs_padded = jnp.pad(obs_float, ((0, 0), (0, 0), (0, 0), (0, 119 - 17)))
         
-        policy_logits, values, _ = state.apply_fn(params, obs_padded)
+        # train=True enables dropout
+        policy_logits, values, _ = state.apply_fn(
+            params, obs_padded, train=True,
+            rngs={'dropout': dropout_key}
+        )
         values = jnp.squeeze(values, -1)
         
-        # Label smoothing for better generalization (key for 20%+!)
+        # Label smoothing for better generalization
         num_classes = policy_logits.shape[-1]
         smooth = 0.1
         one_hot = jax.nn.one_hot(actions, num_classes)
@@ -388,11 +392,11 @@ def train_step(state, obs, actions, targets):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--month', default='2019-09')
-    # BALANCED settings for 2.5M param model
+    # OPTIMIZED for 20%+ accuracy with dropout
     parser.add_argument('--games', type=int, default=50000, help='Max games')
     parser.add_argument('--positions', type=int, default=500000, help='Max positions')
-    parser.add_argument('--steps', type=int, default=25000, help='More steps for better accuracy')
-    parser.add_argument('--batch_size', type=int, default=1024, help='Smaller batch for bigger model')
+    parser.add_argument('--steps', type=int, default=50000, help='More steps = better accuracy')
+    parser.add_argument('--batch_size', type=int, default=1024, help='Batch size')
     parser.add_argument('--max_gb', type=float, default=1.0, help='Max download size')
     parser.add_argument('--output', default='lichess_model.pkl')
     args = parser.parse_args()
@@ -471,11 +475,11 @@ def main():
     state = TrainState.create(apply_fn=agent.apply, params=params, tx=optimizer)
     
     # JIT warmup
-    key, batch_key = jax.random.split(key)
+    key, batch_key, dropout_key = jax.random.split(key, 3)
     b_obs, b_act, b_tgt = sample_batch(batch_key, obs, actions, targets, args.batch_size)
-    state, _ = train_step(state, b_obs, b_act, b_tgt)
+    state, _ = train_step(state, b_obs, b_act, b_tgt, dropout_key)
     jax.block_until_ready(state.step)
-    print("✓ JIT compiled")
+    print("✓ JIT compiled (with dropout)")
     
     # Training
     print()
@@ -489,9 +493,9 @@ def main():
     
     with tqdm(total=args.steps, desc="Training", unit="step") as pbar:
         for step in range(args.steps):
-            key, batch_key = jax.random.split(key)
+            key, batch_key, dropout_key = jax.random.split(key, 3)
             b_obs, b_act, b_tgt = sample_batch(batch_key, obs, actions, targets, args.batch_size)
-            state, metrics = train_step(state, b_obs, b_act, b_tgt)
+            state, metrics = train_step(state, b_obs, b_act, b_tgt, dropout_key)
             
             if step % 100 == 0:
                 jax.block_until_ready(metrics['total_loss'])
