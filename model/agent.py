@@ -24,9 +24,40 @@ from algorithm.pve import ValueHead, RewardHead
 # GPU-ONLY SIMPLE TRANSFORMER (Fast Training)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class SimpleTransformerBlock(nn.Module):
+class GTrXLGate(nn.Module):
     """
-    Transformer block with dropout for better generalization.
+    GTrXL Gating per GPU-Only spec Section 2.3.
+    
+    Replaces simple residual (x + f(x)) with GRU-style update:
+    - r = sigmoid(Wr*x + Ur*f(x))  # reset gate
+    - z = sigmoid(Wz*x + Uz*f(x))  # update gate
+    - h_tilde = tanh(Wh*(r*x) + Uh*f(x))
+    - output = (1-z)*x + z*h_tilde
+    
+    This stabilizes deep recursive networks for RL (spec Section 2.3).
+    """
+    dim: int
+    
+    @nn.compact
+    def __call__(self, x, f_x):
+        # Gates
+        z = nn.sigmoid(nn.Dense(self.dim)(x) + nn.Dense(self.dim)(f_x))
+        r = nn.sigmoid(nn.Dense(self.dim)(x) + nn.Dense(self.dim)(f_x))
+        
+        # Candidate
+        h_tilde = nn.tanh(nn.Dense(self.dim)(r * x) + nn.Dense(self.dim)(f_x))
+        
+        # Gated update
+        return (1 - z) * x + z * h_tilde
+
+
+class GTrXLBlock(nn.Module):
+    """
+    Transformer block with GTrXL gating (GPU-Only spec Section 2.3).
+    
+    Key difference from standard transformer:
+    - Uses GRU-style gates instead of simple residual connections
+    - Stabilizes training for deep recursive models
     """
     hidden_dim: int
     heads: int
@@ -39,7 +70,7 @@ class SimpleTransformerBlock(nn.Module):
         B, L, D = x.shape
         head_dim = self.hidden_dim // self.heads
         
-        # 1. LayerNorm + Multi-head attention
+        # 1. Multi-head attention
         h = nn.LayerNorm()(x)
         
         qkv = nn.Dense(3 * self.hidden_dim, use_bias=False)(h)
@@ -58,9 +89,10 @@ class SimpleTransformerBlock(nn.Module):
         attn_out = nn.Dense(self.hidden_dim)(attn_out)
         attn_out = nn.Dropout(rate=self.dropout_rate, deterministic=self.deterministic)(attn_out)
         
-        x = x + attn_out
+        # GTrXL gating instead of x + attn_out
+        x = GTrXLGate(self.hidden_dim)(x, attn_out)
         
-        # 2. MLP block with dropout
+        # 2. MLP with GTrXL gating
         h = nn.LayerNorm()(x)
         mlp = nn.Dense(self.mlp_dim)(h)
         mlp = nn.gelu(mlp)
@@ -68,25 +100,26 @@ class SimpleTransformerBlock(nn.Module):
         mlp = nn.Dense(self.hidden_dim)(mlp)
         mlp = nn.Dropout(rate=self.dropout_rate, deterministic=self.deterministic)(mlp)
         
-        return x + mlp
+        # GTrXL gating instead of x + mlp
+        return GTrXLGate(self.hidden_dim)(x, mlp)
 
 
 class RecurseZeroAgentSimple(nn.Module):
     """
-    Fast GPU-only agent with dropout for better accuracy.
+    GPU-only agent with GTrXL gating (spec-compliant).
     
-    OPTIMIZED for 20%+ accuracy:
-    - 192 hidden dim
-    - 6 heads
-    - 768 MLP
-    - 4 layers
-    - Dropout 0.1
-    - ~2.8M parameters
+    OPTIMIZED for 40%+ accuracy:
+    - 224 hidden dim (larger capacity)
+    - 8 heads (more attention patterns)
+    - 896 MLP (4x hidden)
+    - 5 layers (deeper reasoning)
+    - GTrXL gating (stable recursive)
+    - ~4M parameters
     """
-    hidden_dim: int = 192
-    heads: int = 6
-    mlp_dim: int = 768
-    num_layers: int = 4
+    hidden_dim: int = 224
+    heads: int = 8
+    mlp_dim: int = 896
+    num_layers: int = 5
     num_actions: int = 4672
     dropout_rate: float = 0.1
     
@@ -94,21 +127,21 @@ class RecurseZeroAgentSimple(nn.Module):
     def __call__(self, x, train: bool = True):
         deterministic = not train
         
-        # 1. Embedding with dropout
+        # 1. Input embedding
         x_embed = nn.Dense(self.hidden_dim, name='input_embed')(x)
         x_embed = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x_embed)
         x_flat = x_embed.reshape(x_embed.shape[0], -1, self.hidden_dim)
         
-        # 2. Stacked transformer blocks
+        # 2. GTrXL transformer blocks
         h = x_flat
         for i in range(self.num_layers):
-            h = SimpleTransformerBlock(
+            h = GTrXLBlock(
                 hidden_dim=self.hidden_dim,
                 heads=self.heads,
                 mlp_dim=self.mlp_dim,
                 dropout_rate=self.dropout_rate,
                 deterministic=deterministic,
-                name=f'block_{i}'
+                name=f'gtrxl_block_{i}'
             )(h)
         
         # 3. Output heads
