@@ -366,11 +366,11 @@ def train_step(state, obs, actions, targets, key):
 def main():
     parser = argparse.ArgumentParser(description="RecurseZero Lichess Training - 100% GPU")
     parser.add_argument('--month', default='2019-09', help='Lichess month')
-    parser.add_argument('--games', type=int, default=100000, help='Max games')
-    parser.add_argument('--positions', type=int, default=1000000, help='Max positions')
-    parser.add_argument('--steps', type=int, default=30000, help='Training steps')
-    parser.add_argument('--batch', type=int, default=2048, help='Batch size')
-    parser.add_argument('--max_gb', type=float, default=2.0, help='Max download GB')
+    parser.add_argument('--games', type=int, default=50000, help='Max games')
+    parser.add_argument('--positions', type=int, default=500000, help='Max positions (fits in 22GB)')
+    parser.add_argument('--steps', type=int, default=40000, help='Training steps')
+    parser.add_argument('--batch', type=int, default=1024, help='Batch size')
+    parser.add_argument('--max_gb', type=float, default=1.0, help='Max download GB')
     parser.add_argument('--output', default='lichess_model.pkl', help='Output path')
     args = parser.parse_args()
     
