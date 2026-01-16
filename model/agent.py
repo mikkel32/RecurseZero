@@ -75,17 +75,17 @@ class RecurseZeroAgentSimple(nn.Module):
     """
     Fast GPU-only agent without DEQ.
     
-    LARGER MODEL for better accuracy:
-    - 256 hidden dim (was 128)
-    - 8 heads (was 4)
-    - 1024 MLP (was 512)
-    - 6 layers (was 3)
-    - ~5M parameters (was 1.2M)
+    BALANCED MODEL for accuracy + VRAM efficiency:
+    - 192 hidden dim
+    - 6 heads
+    - 768 MLP
+    - 4 layers
+    - ~2.5M parameters (fits in 22GB VRAM)
     """
-    hidden_dim: int = 256
-    heads: int = 8
-    mlp_dim: int = 1024
-    num_layers: int = 6
+    hidden_dim: int = 192
+    heads: int = 6
+    mlp_dim: int = 768
+    num_layers: int = 4
     num_actions: int = 4672
     
     @nn.compact

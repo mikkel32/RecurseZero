@@ -388,12 +388,11 @@ def train_step(state, obs, actions, targets):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--month', default='2019-09')
-    # Settings for BIGGER model (~5M params) to reach 20%+ accuracy
-    # Smaller batch needed for larger model
+    # BALANCED settings for 2.5M param model
     parser.add_argument('--games', type=int, default=50000, help='Max games')
     parser.add_argument('--positions', type=int, default=500000, help='Max positions')
-    parser.add_argument('--steps', type=int, default=20000, help='More steps = better accuracy')
-    parser.add_argument('--batch_size', type=int, default=2048, help='Smaller batch for bigger model')
+    parser.add_argument('--steps', type=int, default=25000, help='More steps for better accuracy')
+    parser.add_argument('--batch_size', type=int, default=1024, help='Smaller batch for bigger model')
     parser.add_argument('--max_gb', type=float, default=1.0, help='Max download size')
     parser.add_argument('--output', default='lichess_model.pkl')
     args = parser.parse_args()
