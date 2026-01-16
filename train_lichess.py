@@ -348,8 +348,8 @@ def sample_batch(key, obs, actions, targets, batch_size):
 @jax.jit
 def train_step(state, obs, actions, targets):
     """
-    Training step that handles Int8 quantized 17-plane input.
-    Dequantizes and pads to 119 planes during forward pass only.
+    Training step with label smoothing for better accuracy.
+    Handles Int8 quantized 17-plane input.
     """
     def loss_fn(params):
         # Dequantize Int8 -> FP32 and pad to 119 planes
@@ -359,16 +359,21 @@ def train_step(state, obs, actions, targets):
         policy_logits, values, _ = state.apply_fn(params, obs_padded)
         values = jnp.squeeze(values, -1)
         
+        # Label smoothing for better generalization (key for 20%+!)
+        num_classes = policy_logits.shape[-1]
+        smooth = 0.1
+        one_hot = jax.nn.one_hot(actions, num_classes)
+        smoothed = one_hot * (1.0 - smooth) + smooth / num_classes
+        
         log_probs = jax.nn.log_softmax(policy_logits)
-        one_hot = jax.nn.one_hot(actions, policy_logits.shape[-1])
-        policy_loss = -jnp.mean(jnp.sum(log_probs * one_hot, axis=-1))
+        policy_loss = -jnp.mean(jnp.sum(log_probs * smoothed, axis=-1))
         
         value_loss = jnp.mean((values - targets) ** 2)
         
         predicted = jnp.argmax(policy_logits, axis=-1)
         accuracy = jnp.mean(predicted == actions)
         
-        return policy_loss + 0.5 * value_loss, {'policy_loss': policy_loss, 'value_loss': value_loss, 'accuracy': accuracy}
+        return policy_loss + 0.25 * value_loss, {'policy_loss': policy_loss, 'value_loss': value_loss, 'accuracy': accuracy}
     
     (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
@@ -383,12 +388,12 @@ def train_step(state, obs, actions, targets):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--month', default='2019-09')
-    # Conservative settings that fit in 22GB VRAM
-    # Note: Forward pass pads 17→119 planes, so batch size affects VRAM a lot
+    # Settings for BIGGER model (~5M params) to reach 20%+ accuracy
+    # Smaller batch needed for larger model
     parser.add_argument('--games', type=int, default=50000, help='Max games')
     parser.add_argument('--positions', type=int, default=500000, help='Max positions')
-    parser.add_argument('--steps', type=int, default=15000, help='Training steps')
-    parser.add_argument('--batch_size', type=int, default=4096, help='Batch size (4096 is safe)')
+    parser.add_argument('--steps', type=int, default=20000, help='More steps = better accuracy')
+    parser.add_argument('--batch_size', type=int, default=2048, help='Smaller batch for bigger model')
     parser.add_argument('--max_gb', type=float, default=1.0, help='Max download size')
     parser.add_argument('--output', default='lichess_model.pkl')
     args = parser.parse_args()
@@ -445,7 +450,21 @@ def main():
     param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"✓ Model: {param_count:,} parameters")
     
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate=1e-3))
+    # Cosine learning rate schedule with warmup
+    warmup_steps = min(1000, args.steps // 10)
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=1e-4,
+        peak_value=1e-3,
+        warmup_steps=warmup_steps,
+        decay_steps=args.steps,
+        end_value=1e-5
+    )
+    
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=schedule, weight_decay=0.01)
+    )
+    print(f"✓ Cosine LR: 1e-4 → 1e-3 → 1e-5")
     
     class TrainState(train_state.TrainState):
         pass

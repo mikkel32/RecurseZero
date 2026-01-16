@@ -75,12 +75,17 @@ class RecurseZeroAgentSimple(nn.Module):
     """
     Fast GPU-only agent without DEQ.
     
-    For training speed. Uses stacked transformer layers.
+    LARGER MODEL for better accuracy:
+    - 256 hidden dim (was 128)
+    - 8 heads (was 4)
+    - 1024 MLP (was 512)
+    - 6 layers (was 3)
+    - ~5M parameters (was 1.2M)
     """
-    hidden_dim: int = 128
-    heads: int = 4
-    mlp_dim: int = 512
-    num_layers: int = 3
+    hidden_dim: int = 256
+    heads: int = 8
+    mlp_dim: int = 1024
+    num_layers: int = 6
     num_actions: int = 4672
     
     @nn.compact
