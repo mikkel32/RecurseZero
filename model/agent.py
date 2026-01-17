@@ -108,18 +108,18 @@ class RecurseZeroAgentSimple(nn.Module):
     """
     GPU-only agent with GTrXL gating (spec-compliant).
     
-    OPTIMIZED for 40%+ accuracy:
-    - 224 hidden dim (larger capacity)
-    - 8 heads (more attention patterns)
-    - 896 MLP (4x hidden)
-    - 5 layers (deeper reasoning)
+    MEMORY-OPTIMIZED for self-play training:
+    - 192 hidden dim (smaller for GPU batch)
+    - 6 heads
+    - 768 MLP (4x hidden)
+    - 4 layers
     - GTrXL gating (stable recursive)
-    - ~4M parameters
+    - ~2.5M parameters (fits with batch 512)
     """
-    hidden_dim: int = 224
-    heads: int = 8
-    mlp_dim: int = 896
-    num_layers: int = 5
+    hidden_dim: int = 192
+    heads: int = 6
+    mlp_dim: int = 768
+    num_layers: int = 4
     num_actions: int = 4672
     dropout_rate: float = 0.1
     
