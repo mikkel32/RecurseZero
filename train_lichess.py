@@ -333,9 +333,9 @@ def train_step(state, obs, actions, targets, key):
         )
         values = jnp.squeeze(values, -1)
         
-        # Policy loss with label smoothing (better generalization)
+        # Policy loss with MILD label smoothing (reduced for stability)
         n_cls = logits.shape[-1]
-        smooth = 0.1
+        smooth = 0.05  # Reduced from 0.1 for more stable training
         one_hot = jax.nn.one_hot(actions, n_cls)
         smoothed = one_hot * (1.0 - smooth) + smooth / n_cls
         
@@ -368,8 +368,8 @@ def main():
     parser.add_argument('--month', default='2019-09', help='Lichess month')
     parser.add_argument('--games', type=int, default=50000, help='Max games')
     parser.add_argument('--positions', type=int, default=500000, help='Max positions')
-    parser.add_argument('--steps', type=int, default=80000, help='Training steps (2x more)')
-    parser.add_argument('--batch', type=int, default=512, help='Batch size (smaller for bigger model)')
+    parser.add_argument('--steps', type=int, default=80000, help='Training steps')
+    parser.add_argument('--batch', type=int, default=2048, help='Batch size (larger for stable gradients)')
     parser.add_argument('--max_gb', type=float, default=1.0, help='Max download GB')
     parser.add_argument('--output', default='lichess_model.pkl', help='Output path')
     args = parser.parse_args()
@@ -435,17 +435,17 @@ def main():
     # Optimizer with cosine LR
     warmup = min(1000, args.steps // 10)
     schedule = optax.warmup_cosine_decay_schedule(
-        init_value=1e-4,
-        peak_value=1e-3,
+        init_value=3e-5,       # Lower start (was 1e-4)
+        peak_value=3e-4,       # Lower peak (was 1e-3) - KEY FIX
         warmup_steps=warmup,
         decay_steps=args.steps,
-        end_value=1e-5
+        end_value=1e-6         # Lower end (was 1e-5)
     )
     opt = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(learning_rate=schedule, weight_decay=0.01)
     )
-    print(f"✓ Cosine LR: 1e-4 → 1e-3 → 1e-5 (warmup={warmup})")
+    print(f"✓ Cosine LR: 3e-5 → 3e-4 → 1e-6 (warmup={warmup})")
     
     class TrainState(train_state.TrainState):
         pass

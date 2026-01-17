@@ -348,29 +348,100 @@ def get_ai_move(board: chess.Board, history: list, params, info) -> chess.Move:
     """
     Get AI move using the loaded model.
     
-    Uses simple inference - no MCTS for speed.
+    IMPORTANT: Must use EXACT architecture that matches trained checkpoint.
     """
     import jax
     import jax.numpy as jnp
+    import flax.linen as nn
     
     # Get observation and normalize to match training
     obs = board_to_observation(board, history)
-    
-    # CRITICAL: Training uses Int8 values divided by 127.0
-    # Convert to Int8-like values (0 or 1 -> 0 or 127) then divide
     obs_int8 = (obs * 127).astype(np.int8)
     obs_normalized = obs_int8.astype(np.float32) / 127.0
     obs_jax = jnp.array(obs_normalized)
     
-    # Create model with MATCHING architecture from trained model
-    from model.agent import RecurseZeroAgentSimple
+    # Define the EXACT model architecture that matches the trained checkpoint
+    # Based on params inspection: block_0-3, Dense_0-3 per block, 192 hidden
     
-    # Use default architecture that matches the trained model
-    # The trained models use: 192-224 hidden, 6-8 heads, 4-5 layers
-    agent = RecurseZeroAgentSimple(num_actions=4672)
+    class PolicyHead(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            x = nn.Dense(192, name='fc1')(x)
+            x = nn.relu(x)
+            return nn.Dense(4672, name='fc2')(x)
     
-    # Ensure params are in correct format
-    # The checkpoint saves as {'params': {...}} but apply needs the full dict
+    class ValueHead(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            x = nn.Dense(192, name='fc1')(x)
+            x = nn.relu(x)
+            return nn.tanh(nn.Dense(1, name='fc2')(x))
+    
+    class RewardHead(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            x = nn.Dense(192, name='fc1')(x)
+            x = nn.relu(x)
+            return nn.tanh(nn.Dense(1, name='fc2')(x))
+    
+    class SimpleBlock(nn.Module):
+        hidden_dim: int = 192
+        heads: int = 6
+        mlp_dim: int = 768
+        
+        @nn.compact
+        def __call__(self, x):
+            B, L, D = x.shape
+            head_dim = self.hidden_dim // self.heads
+            
+            # Attention
+            h = nn.LayerNorm(name='LayerNorm_0')(x)
+            qkv = nn.Dense(3 * self.hidden_dim, use_bias=False, name='Dense_0')(h)
+            q, k, v = jnp.split(qkv, 3, axis=-1)
+            
+            q = q.reshape(B, L, self.heads, head_dim).transpose(0, 2, 1, 3)
+            k = k.reshape(B, L, self.heads, head_dim).transpose(0, 2, 1, 3)
+            v = v.reshape(B, L, self.heads, head_dim).transpose(0, 2, 1, 3)
+            
+            scale = jnp.sqrt(jnp.float32(head_dim))
+            attn = nn.softmax(jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale, axis=-1)
+            attn_out = jnp.matmul(attn, v)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, L, self.hidden_dim)
+            attn_out = nn.Dense(self.hidden_dim, name='Dense_1')(attn_out)
+            x = x + attn_out
+            
+            # MLP
+            h = nn.LayerNorm(name='LayerNorm_1')(x)
+            mlp = nn.Dense(self.mlp_dim, name='Dense_2')(h)
+            mlp = nn.gelu(mlp)
+            mlp = nn.Dense(self.hidden_dim, name='Dense_3')(mlp)
+            return x + mlp
+    
+    class TrainedAgent(nn.Module):
+        """Exact architecture matching the 32.5% checkpoint."""
+        @nn.compact
+        def __call__(self, x, train: bool = False):
+            # Input embedding
+            x = nn.Dense(192, name='input_embed')(x)
+            x = x.reshape(x.shape[0], -1, 192)
+            
+            # 4 transformer blocks with exact names
+            for i in range(4):
+                x = SimpleBlock(name=f'block_{i}')(x)
+            
+            # Global average pooling
+            z = jnp.mean(x, axis=1)
+            
+            # Output heads with exact names
+            policy = PolicyHead(name='policy')(z)
+            value = ValueHead(name='value')(z)
+            reward = RewardHead(name='reward')(z)
+            
+            return policy, value, reward
+    
+    agent = TrainedAgent()
+    
+    # Ensure params format
     if 'params' not in params:
         params = {'params': params}
     
@@ -379,16 +450,17 @@ def get_ai_move(board: chess.Board, history: list, params, info) -> chess.Move:
         policy_logits, value, _ = agent.apply(params, obs_jax, train=False)
         policy = np.array(policy_logits[0])
         
-        # Apply softmax to convert logits to probabilities
+        # Softmax to probabilities
         policy_probs = np.exp(policy - np.max(policy))
         policy_probs = policy_probs / policy_probs.sum()
         
-        print(f"   AI thinks value: {float(value[0]):.2f}")
+        # Get value as numpy scalar
+        val = float(np.array(value).flatten()[0])
+        print(f"   AI value: {val:.2f}")
     except Exception as e:
         print(f"Inference error: {e}")
         import traceback
         traceback.print_exc()
-        # Fallback to random legal move
         import random
         return random.choice(list(board.legal_moves))
     
