@@ -105,10 +105,11 @@ def resident_train_step(
     is_draw = (terminated) & (jnp.abs(rewards) < 0.5)
     is_loss = (terminated) & (rewards < -0.5)
     
-    # Reward shaping: Encourage decisive play
+    # Reward shaping: Encourage decisive play, DISCOURAGE draws
     shaped_rewards = rewards
-    shaped_rewards = jnp.where(is_draw, -0.1, shaped_rewards)  # Slight draw penalty
-    shaped_rewards = jnp.where(is_win, rewards * 1.2, shaped_rewards)  # Win bonus
+    shaped_rewards = jnp.where(is_draw, -0.3, shaped_rewards)  # Strong draw penalty
+    shaped_rewards = jnp.where(is_win, 1.5, shaped_rewards)     # Flat win bonus
+    shaped_rewards = jnp.where(is_loss, -1.0, shaped_rewards)   # Loss penalty
     
     # TD targets
     next_obs = next_env_state.observation
@@ -139,11 +140,11 @@ def resident_train_step(
         selected_log_probs = jnp.sum(log_probs * one_hot, axis=-1)
         pg_loss = -jnp.mean(selected_log_probs * advantages)
         
-        # Entropy bonus (exploration)
+        # Entropy bonus (POSITIVE for exploration - was negative!)
         entropy = -jnp.sum(probs * log_probs, axis=-1)
-        entropy_bonus = -0.05 * jnp.mean(entropy)
+        entropy_bonus = 0.01 * jnp.mean(entropy)  # Encourage exploration
         
-        # PVE losses
+        # PVE losses (increased value weight for better learning)
         value_loss = jnp.mean(jnp.square(v_pred - target_values))
         reward_loss = jnp.mean(jnp.where(
             terminated, 
@@ -151,7 +152,8 @@ def resident_train_step(
             0.0
         ))
         
-        total = pg_loss + entropy_bonus + 0.5 * value_loss + 0.1 * reward_loss
+        # Total loss: stronger value learning
+        total = pg_loss - entropy_bonus + 1.0 * value_loss + 0.5 * reward_loss
         
         return total, {
             'pg_loss': pg_loss,
