@@ -78,8 +78,8 @@ def resident_train_step(
     obs = env_state.observation
     current_player = env_state.current_player
     
-    # Forward pass (model handles BF16 casting internally)
-    policy_logits, values, reward_pred = agent_apply_fn(state.params, obs)
+    # Forward pass (train=False disables dropout for inference)
+    policy_logits, values, reward_pred = agent_apply_fn(state.params, obs, train=False)
     
     # Get legal action mask
     legal_mask = env_state.legal_action_mask
@@ -112,7 +112,7 @@ def resident_train_step(
     
     # TD targets
     next_obs = next_env_state.observation
-    _, next_values, _ = agent_apply_fn(state.params, next_obs)
+    _, next_values, _ = agent_apply_fn(state.params, next_obs, train=False)
     next_vals = jnp.squeeze(next_values, -1)
     next_vals = jnp.where(terminated, 0.0, next_vals)
     
@@ -125,7 +125,7 @@ def resident_train_step(
     
     # Loss function
     def loss_fn(params):
-        p_logits, v_pred, r_pred = agent_apply_fn(params, obs)
+        p_logits, v_pred, r_pred = agent_apply_fn(params, obs, train=False)
         v_pred = jnp.squeeze(v_pred, -1)
         r_pred = jnp.squeeze(r_pred, -1)
         
