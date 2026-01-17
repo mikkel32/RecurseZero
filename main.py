@@ -121,8 +121,8 @@ def main():
     apply_patch()
     
     # 1. Initialize Environment
-    # Batch 1024 for 23GB GPU (was 512 for smaller GPUs)
-    BATCH_SIZE = 1024
+    # Batch 2048 for 23GB GPU (uses ~16GB, leaves headroom)
+    BATCH_SIZE = 2048
     
     # Verify we're on GPU-only (no CPU fallback)
     devices = jax.devices()
@@ -195,8 +195,8 @@ def main():
     print(f"  {format_gpu_str(gpu_stats)}")
     
     # 5. Training Loop
-    NUM_STEPS = 10000
-    PRINT_EVERY = 100
+    NUM_STEPS = 50000
+    PRINT_EVERY = 500
     
     print()
     print("=" * 60)

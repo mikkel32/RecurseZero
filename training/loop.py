@@ -105,9 +105,9 @@ def resident_train_step(
     is_draw = (terminated) & (jnp.abs(rewards) < 0.5)
     is_loss = (terminated) & (rewards < -0.5)
     
-    # Reward shaping: Encourage decisive play, DISCOURAGE draws
+    # Reward shaping: STRONGLY DISCOURAGE draws, reward decisive play
     shaped_rewards = rewards
-    shaped_rewards = jnp.where(is_draw, -0.3, shaped_rewards)  # Strong draw penalty
+    shaped_rewards = jnp.where(is_draw, -0.5, shaped_rewards)  # Strong draw penalty
     shaped_rewards = jnp.where(is_win, 1.5, shaped_rewards)     # Flat win bonus
     shaped_rewards = jnp.where(is_loss, -1.0, shaped_rewards)   # Loss penalty
     
