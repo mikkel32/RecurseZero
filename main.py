@@ -121,9 +121,9 @@ def main():
     apply_patch()
     
     # 1. Initialize Environment
-    # TESTED: batch 2048 gives best throughput (1.8 s/s × 2048 = 3686 pos/sec)
-    # Larger batch is slower per-step, doesn't improve total throughput
-    BATCH_SIZE = 2048
+    # REDUCED: batch 512 to avoid OOM with 7M param model
+    # (2048 was causing 16GB allocation failure)
+    BATCH_SIZE = 512
     
     # Verify we're on GPU-only (no CPU fallback)
     devices = jax.devices()
