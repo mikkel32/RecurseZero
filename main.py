@@ -121,9 +121,8 @@ def main():
     apply_patch()
     
     # 1. Initialize Environment
-    # REDUCED: batch 512 to avoid OOM with 7M param model
-    # (2048 was causing 16GB allocation failure)
-    BATCH_SIZE = 512
+    # Batch 1024 for 23GB GPU (was 512 for smaller GPUs)
+    BATCH_SIZE = 1024
     
     # Verify we're on GPU-only (no CPU fallback)
     devices = jax.devices()

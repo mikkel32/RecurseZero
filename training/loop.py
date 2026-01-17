@@ -185,7 +185,9 @@ def resident_train_step(
     games_done = jnp.sum(terminated)
     wins = jnp.sum(is_win)
     draws = jnp.sum(is_draw)
-    losses = jnp.sum(is_loss)
+    # In self-play, every win by player A is a loss by player B
+    # So losses = wins (for the opponent perspective)
+    losses = wins  # Self-play: W=L always
     
     # Win probability (spec 5.2)
     mean_value = jnp.mean(values)
